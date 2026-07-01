@@ -1,0 +1,14 @@
+# Go build/test output
+/bin/
+/dist/
+*.test
+*.out
+coverage.out
+
+# Local caches and scratch data
+/tmp/
+.cache/
+*.log
+
+# macOS
+.DS_Store
