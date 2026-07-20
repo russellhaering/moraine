@@ -101,9 +101,11 @@ func SerializeTombstone() []byte {
 	return []byte{flagTombstone}
 }
 
-// IsTombstone reports whether data is a document-layer tombstone.
+// IsTombstone reports whether data is a document-layer tombstone. Empty data
+// also counts: the pre-extraction engine wrote deletions as zero-length
+// values, and a valid document always serializes to at least one flag byte.
 func IsTombstone(data []byte) bool {
-	return len(data) > 0 && data[0]&flagTombstone != 0
+	return len(data) == 0 || data[0]&flagTombstone != 0
 }
 
 // Deserialize decodes a stored document. The caller must set ID from the key.

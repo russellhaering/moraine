@@ -546,7 +546,11 @@ func decodeEntry(block []byte, offset int) (Entry, int, error) {
 	valLenRaw := binary.LittleEndian.Uint32(block[pos : pos+4])
 	pos += 4
 
-	if valLenRaw == tombstoneValueLen {
+	// Zero-length values are also decoded as tombstones: the pre-extraction
+	// engine encoded deletions as len-0 values (no sentinel), so stores written
+	// by it contain them. Documents and real values always serialize to at
+	// least one byte, making the legacy form unambiguous in practice.
+	if valLenRaw == tombstoneValueLen || valLenRaw == 0 {
 		if pos+8 > len(block) {
 			return Entry{}, 0, errors.New("sstable: truncated seq num")
 		}

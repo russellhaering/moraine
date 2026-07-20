@@ -493,3 +493,40 @@ func TestDataTooShortForFooter(t *testing.T) {
 		t.Fatal("expected error for data shorter than footer")
 	}
 }
+
+// TestDecodeEntryLegacyZeroLengthTombstone verifies that entries written by
+// the pre-extraction engine — which encoded deletions as zero-length values
+// rather than the tombstone sentinel — decode as tombstones (nil Value).
+// Regression test for production stores written before the extraction.
+func TestDecodeEntryLegacyZeroLengthTombstone(t *testing.T) {
+	// Hand-encode the legacy form: keyLen, key, valLen=0, seqNum.
+	var block []byte
+	block = appendUint32(block, 3)
+	block = append(block, "doc"...)
+	block = appendUint32(block, 0) // legacy tombstone: zero-length value, no sentinel
+	block = appendUint64(block, 42)
+
+	entry, n, err := decodeEntry(block, 0)
+	if err != nil {
+		t.Fatalf("decode legacy tombstone: %v", err)
+	}
+	if n != len(block) {
+		t.Fatalf("consumed %d bytes, want %d", n, len(block))
+	}
+	if entry.Key != "doc" || entry.SeqNum != 42 {
+		t.Fatalf("unexpected entry: %+v", entry)
+	}
+	if entry.Value != nil {
+		t.Fatalf("legacy zero-length value must decode as tombstone (nil), got %#v", entry.Value)
+	}
+
+	// Sentinel-encoded tombstones still decode identically.
+	sentinel := appendEntry(nil, Entry{Key: "doc", Value: nil, SeqNum: 42})
+	entry2, _, err := decodeEntry(sentinel, 0)
+	if err != nil {
+		t.Fatalf("decode sentinel tombstone: %v", err)
+	}
+	if entry2.Value != nil {
+		t.Fatalf("sentinel tombstone must decode as nil, got %#v", entry2.Value)
+	}
+}

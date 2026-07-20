@@ -72,3 +72,20 @@ func TestSchemaValidate(t *testing.T) {
 		t.Fatal("expected unknown field error")
 	}
 }
+
+// TestIsTombstoneLegacyEmpty covers the pre-extraction encoding of deletions
+// as zero-length values.
+func TestIsTombstoneLegacyEmpty(t *testing.T) {
+	if !IsTombstone(nil) {
+		t.Fatal("nil must be a tombstone")
+	}
+	if !IsTombstone([]byte{}) {
+		t.Fatal("empty (legacy) value must be a tombstone")
+	}
+	if !IsTombstone(SerializeTombstone()) {
+		t.Fatal("flag tombstone must be a tombstone")
+	}
+	if IsTombstone([]byte{flagHasContent}) {
+		t.Fatal("live document must not be a tombstone")
+	}
+}
