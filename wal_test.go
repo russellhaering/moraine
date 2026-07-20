@@ -120,8 +120,8 @@ func TestWrite_WithTombstones(t *testing.T) {
 	if entry == nil {
 		t.Fatal("reader.Get(dead) returned nil, want tombstone entry")
 	}
-	if len(entry.Value) != 0 {
-		t.Errorf("tombstone entry Value=%v, want empty/nil", entry.Value)
+	if entry.Value != nil {
+		t.Errorf("tombstone entry Value=%v, want nil", entry.Value)
 	}
 
 	// Check alive entry has its value.
@@ -429,6 +429,17 @@ func TestWAL_walPathMethod(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("walPath(%d)=%q, want %q", tc.id, got, tc.want)
 		}
+	}
+}
+
+func TestEpochWAL_walPathMethod(t *testing.T) {
+	store := objstore.NewMemoryStore()
+	wal := newEpochWAL(store, "pfx", 0, 7)
+
+	got := wal.walPath(42)
+	want := "pfx/wal/00000000000000000007/00000000000000000042.sst"
+	if got != want {
+		t.Fatalf("walPath=%q, want %q", got, want)
 	}
 }
 

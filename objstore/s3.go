@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -23,16 +25,39 @@ type S3Store struct {
 
 // S3Config holds configuration for creating an S3Store.
 type S3Config struct {
-	Bucket   string
-	Region   string
-	Endpoint string
-	Prefix   string
+	Bucket          string
+	Region          string
+	Endpoint        string
+	Prefix          string
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+}
+
+// R2Config holds configuration for creating a Cloudflare R2-backed store.
+type R2Config struct {
+	AccountID       string
+	Bucket          string
+	AccessKeyID     string
+	SecretAccessKey string
+	SessionToken    string
+	Prefix          string
+	Jurisdiction    string
+	Endpoint        string
 }
 
 // NewS3Store creates a new S3-backed object store.
 func NewS3Store(ctx context.Context, cfg S3Config) (*S3Store, error) {
 	opts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
+	}
+	if cfg.AccessKeyID != "" || cfg.SecretAccessKey != "" || cfg.SessionToken != "" {
+		if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
+			return nil, fmt.Errorf("both AccessKeyID and SecretAccessKey are required for static credentials")
+		}
+		opts = append(opts, awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken),
+		))
 	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
@@ -42,9 +67,10 @@ func NewS3Store(ctx context.Context, cfg S3Config) (*S3Store, error) {
 
 	var s3Opts []func(*s3.Options)
 	s3Opts = append(s3Opts, func(o *s3.Options) {
-		// Disable response checksum validation — not all S3-compatible
-		// stores (e.g. Tigris) support the same checksum algorithms,
-		// and the SDK wastes time warning/retrying.
+		// Avoid automatic checksums unless an operation requires them. Not all
+		// S3-compatible stores support the same checksum algorithms, and the SDK
+		// otherwise spends time warning/retrying.
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 	if cfg.Endpoint != "" {
@@ -60,6 +86,34 @@ func NewS3Store(ctx context.Context, cfg S3Config) (*S3Store, error) {
 		bucket: cfg.Bucket,
 		prefix: cfg.Prefix,
 	}, nil
+}
+
+// NewR2Store creates a new Cloudflare R2-backed object store.
+func NewR2Store(ctx context.Context, cfg R2Config) (*S3Store, error) {
+	endpoint := cfg.Endpoint
+	if endpoint == "" {
+		if cfg.AccountID == "" {
+			return nil, fmt.Errorf("AccountID is required when Endpoint is not set")
+		}
+
+		jurisdiction := strings.ToLower(strings.TrimSpace(cfg.Jurisdiction))
+		switch jurisdiction {
+		case "", "default":
+			endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.AccountID)
+		default:
+			endpoint = fmt.Sprintf("https://%s.%s.r2.cloudflarestorage.com", cfg.AccountID, jurisdiction)
+		}
+	}
+
+	return NewS3Store(ctx, S3Config{
+		Bucket:          cfg.Bucket,
+		Region:          "auto",
+		Endpoint:        endpoint,
+		Prefix:          cfg.Prefix,
+		AccessKeyID:     cfg.AccessKeyID,
+		SecretAccessKey: cfg.SecretAccessKey,
+		SessionToken:    cfg.SessionToken,
+	})
 }
 
 func (s *S3Store) fullKey(key string) string {

@@ -10,6 +10,10 @@ import (
 	"github.com/russellhaering/moraine/objstore"
 )
 
+// ErrStaleWriter is returned when a writer tries to commit after a newer writer
+// has claimed the same database prefix.
+var ErrStaleWriter = errors.New("stale writer")
+
 // Writer is the single-writer for an LSM database. It manages the active
 // MemTable, frozen MemTables pending flush, and the WAL. It uses epoch-based
 // fencing to ensure only one writer is active at a time.
@@ -60,6 +64,7 @@ func OpenWriter(ctx context.Context, cfg WriterConfig) (*Writer, error) {
 			WriterEpoch:    existing.WriterEpoch + 1,
 			CompactorEpoch: existing.CompactorEpoch,
 			WALIDNext:      existing.WALIDNext,
+			LastSeqNum:     existing.LastSeqNum,
 			L0:             existing.L0,
 			SortedRuns:     existing.SortedRuns,
 		}
@@ -81,8 +86,9 @@ func OpenWriter(ctx context.Context, cfg WriterConfig) (*Writer, error) {
 		prefix:          cfg.Prefix,
 		manifest:        ms,
 		active:          NewMemTable(),
-		wal:             NewWAL(cfg.Store, cfg.Prefix, m.WALIDNext),
+		wal:             newEpochWAL(cfg.Store, cfg.Prefix, m.WALIDNext, m.WriterEpoch),
 		epoch:           m.WriterEpoch,
+		seqNum:          m.LastSeqNum,
 		maxSize:         maxSize,
 		currentManifest: m,
 	}, nil
@@ -153,6 +159,17 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 		return nil
 	}
 
+	latest, err := w.manifest.LoadLatest(ctx)
+	if err != nil {
+		return fmt.Errorf("writer: reload manifest: %w", err)
+	}
+	if latest != nil {
+		if latest.WriterEpoch != w.epoch {
+			return fmt.Errorf("writer: epoch %d superseded by epoch %d: %w", w.epoch, latest.WriterEpoch, ErrStaleWriter)
+		}
+		w.currentManifest = latest
+	}
+
 	frozen := w.active.Freeze()
 	w.frozen = append([]*MemTable{frozen}, w.frozen...)
 	w.active = NewMemTable()
@@ -165,7 +182,7 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 	// Prepend new L0 SSTable (newest first).
 	sstInfo := SSTInfo{
 		ID:     meta.ID,
-		Path:   fmt.Sprintf("%s/wal/%020d.sst", w.prefix, walID),
+		Path:   w.wal.walPath(walID),
 		MinKey: meta.MinKey,
 		MaxKey: meta.MaxKey,
 		MinSeq: meta.MinSeq,
@@ -182,7 +199,15 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 			return fmt.Errorf("writer: reload manifest: %w", err)
 		}
 		if latest != nil {
+			if latest.WriterEpoch != w.epoch {
+				return fmt.Errorf("writer: epoch %d superseded by epoch %d: %w", w.epoch, latest.WriterEpoch, ErrStaleWriter)
+			}
 			w.currentManifest = latest
+		}
+
+		lastSeqNum := w.currentManifest.LastSeqNum
+		if meta.MaxSeq > lastSeqNum {
+			lastSeqNum = meta.MaxSeq
 		}
 
 		newManifest := &Manifest{
@@ -190,6 +215,7 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 			WriterEpoch:    w.epoch,
 			CompactorEpoch: w.currentManifest.CompactorEpoch,
 			WALIDNext:      walID + 1,
+			LastSeqNum:     lastSeqNum,
 			SortedRuns:     w.currentManifest.SortedRuns,
 			L0:             append([]SSTInfo{sstInfo}, w.currentManifest.L0...),
 		}

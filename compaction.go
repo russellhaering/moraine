@@ -154,6 +154,7 @@ func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
 			WriterEpoch:    base.WriterEpoch,
 			CompactorEpoch: base.CompactorEpoch + 1,
 			WALIDNext:      base.WALIDNext,
+			LastSeqNum:     base.LastSeqNum,
 			L0:             remainingL0,
 			SortedRuns:     append([]SortedRun{newSortedRun}, existingRuns...),
 		}
@@ -175,10 +176,9 @@ func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
 }
 
 // deduplicateEntries keeps the entry with the highest seqnum for each key.
+// If sequence numbers tie, the first entry wins; callers pass entries in
+// newest-source-first order.
 func deduplicateEntries(entries []Entry) []Entry {
-	// Sort by key, then by descending seqnum.
-	sortEntries(entries)
-
 	best := make(map[string]Entry)
 	for _, e := range entries {
 		if existing, ok := best[e.Key]; !ok || e.SeqNum > existing.SeqNum {

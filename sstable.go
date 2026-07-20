@@ -24,6 +24,10 @@ const (
 
 	// bloomHashCount is the number of hash functions for the bloom filter.
 	bloomHashCount = 7
+
+	// tombstoneValueLen marks a nil value in serialized entries. Real values
+	// cannot reach this length in memory.
+	tombstoneValueLen = ^uint32(0)
 )
 
 // SSTableMeta holds metadata about an SSTable.
@@ -508,6 +512,11 @@ func (it *SSTableIterator) Err() error {
 func appendEntry(buf []byte, e Entry) []byte {
 	buf = appendUint32(buf, uint32(len(e.Key)))
 	buf = append(buf, e.Key...)
+	if e.Value == nil {
+		buf = appendUint32(buf, tombstoneValueLen)
+		buf = appendUint64(buf, e.SeqNum)
+		return buf
+	}
 	buf = appendUint32(buf, uint32(len(e.Value)))
 	buf = append(buf, e.Value...)
 	buf = appendUint64(buf, e.SeqNum)
@@ -534,9 +543,19 @@ func decodeEntry(block []byte, offset int) (Entry, int, error) {
 	if pos+4 > len(block) {
 		return Entry{}, 0, errors.New("sstable: truncated value length")
 	}
-	valLen := int(binary.LittleEndian.Uint32(block[pos : pos+4]))
+	valLenRaw := binary.LittleEndian.Uint32(block[pos : pos+4])
 	pos += 4
 
+	if valLenRaw == tombstoneValueLen {
+		if pos+8 > len(block) {
+			return Entry{}, 0, errors.New("sstable: truncated seq num")
+		}
+		seqNum := binary.LittleEndian.Uint64(block[pos : pos+8])
+		pos += 8
+		return Entry{Key: key, Value: nil, SeqNum: seqNum}, pos - offset, nil
+	}
+
+	valLen := int(valLenRaw)
 	if pos+valLen > len(block) {
 		return Entry{}, 0, errors.New("sstable: truncated value")
 	}

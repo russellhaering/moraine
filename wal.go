@@ -13,6 +13,7 @@ type WAL struct {
 	store  objstore.ObjectStore
 	prefix string
 	nextID uint64
+	epoch  uint64
 }
 
 // NewWAL creates a new WAL writer.
@@ -24,8 +25,19 @@ func NewWAL(store objstore.ObjectStore, prefix string, startID uint64) *WAL {
 	}
 }
 
+// newEpochWAL creates a WAL writer whose object paths are scoped to a writer
+// epoch, preventing stale writers from colliding with future writers.
+func newEpochWAL(store objstore.ObjectStore, prefix string, startID, epoch uint64) *WAL {
+	w := NewWAL(store, prefix, startID)
+	w.epoch = epoch
+	return w
+}
+
 // walPath returns the object storage key for a WAL file.
 func (w *WAL) walPath(id uint64) string {
+	if w.epoch > 0 {
+		return fmt.Sprintf("%s/wal/%020d/%020d.sst", w.prefix, w.epoch, id)
+	}
 	return fmt.Sprintf("%s/wal/%020d.sst", w.prefix, id)
 }
 

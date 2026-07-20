@@ -34,6 +34,7 @@ type Manifest struct {
 	WriterEpoch    uint64      `json:"writer_epoch"`
 	CompactorEpoch uint64      `json:"compactor_epoch"`
 	WALIDNext      uint64      `json:"wal_id_next"`
+	LastSeqNum     uint64      `json:"last_seq_num"`
 	L0             []SSTInfo   `json:"l0"`
 	SortedRuns     []SortedRun `json:"sorted_runs"`
 }
@@ -56,6 +57,8 @@ func (ms *ManifestStore) manifestPath(version uint64) string {
 // Save writes a manifest file using conditional put (CAS). Returns
 // ErrPreconditionFailed if the version already exists.
 func (ms *ManifestStore) Save(ctx context.Context, m *Manifest) error {
+	normalizeManifestSeqNum(m)
+
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("manifest: marshal: %w", err)
@@ -80,6 +83,7 @@ func (ms *ManifestStore) Load(ctx context.Context, version uint64) (*Manifest, e
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("manifest: unmarshal version %d: %w", version, err)
 	}
+	normalizeManifestSeqNum(&m)
 	return &m, nil
 }
 
@@ -109,7 +113,38 @@ func (ms *ManifestStore) LoadLatest(ctx context.Context) (*Manifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("manifest: unmarshal latest: %w", err)
 	}
+	normalizeManifestSeqNum(&m)
 	return &m, nil
+}
+
+func normalizeManifestSeqNum(m *Manifest) {
+	if m == nil {
+		return
+	}
+	if maxSeq := maxSeqFromManifest(m); maxSeq > m.LastSeqNum {
+		m.LastSeqNum = maxSeq
+	}
+}
+
+func maxSeqFromManifest(m *Manifest) uint64 {
+	if m == nil {
+		return 0
+	}
+
+	var maxSeq uint64
+	for _, sst := range m.L0 {
+		if sst.MaxSeq > maxSeq {
+			maxSeq = sst.MaxSeq
+		}
+	}
+	for _, run := range m.SortedRuns {
+		for _, sst := range run.SSTables {
+			if sst.MaxSeq > maxSeq {
+				maxSeq = sst.MaxSeq
+			}
+		}
+	}
+	return maxSeq
 }
 
 // ListVersions returns all manifest version numbers in ascending order.

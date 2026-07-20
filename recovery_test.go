@@ -225,6 +225,160 @@ func TestWALRecoveryOverwriteThenReopen(t *testing.T) {
 	}
 }
 
+func TestReopenAdvancesSequenceNumbersBeforeCompaction(t *testing.T) {
+	ctx := context.Background()
+	store := objstore.NewMemoryStore()
+
+	db, err := Open(ctx, DBConfig{
+		Store:           store,
+		Prefix:          "test",
+		L0CompactThresh: 2,
+		CompactInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	seq, err := db.Put(ctx, "key1", []byte("v1"))
+	if err != nil {
+		t.Fatalf("Put v1: %v", err)
+	}
+	if seq != 1 {
+		t.Fatalf("Put v1 seq = %d, want 1", seq)
+	}
+	if err := db.Flush(ctx); err != nil {
+		t.Fatalf("Flush v1: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2, err := Open(ctx, DBConfig{
+		Store:           store,
+		Prefix:          "test",
+		L0CompactThresh: 2,
+		CompactInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+
+	seq, err = db2.Put(ctx, "key1", []byte("v2"))
+	if err != nil {
+		t.Fatalf("Put v2: %v", err)
+	}
+	if seq != 2 {
+		t.Fatalf("Put v2 seq = %d, want 2", seq)
+	}
+	if err := db2.Flush(ctx); err != nil {
+		t.Fatalf("Flush v2: %v", err)
+	}
+	if err := db2.Compact(ctx); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	entry, ok, err := db2.Get(ctx, "key1")
+	if err != nil {
+		t.Fatalf("Get key1 after compaction: %v", err)
+	}
+	if !ok || string(entry.Value) != "v2" {
+		t.Fatalf("Get key1 after compaction = (%v, %v), want v2", entry, ok)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("Close db2: %v", err)
+	}
+
+	db3, err := Open(ctx, DBConfig{
+		Store:           store,
+		Prefix:          "test",
+		L0CompactThresh: 2,
+		CompactInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Reopen after compaction: %v", err)
+	}
+	defer db3.Close()
+
+	entry, ok, err = db3.Get(ctx, "key1")
+	if err != nil {
+		t.Fatalf("Get key1 after reopen: %v", err)
+	}
+	if !ok || string(entry.Value) != "v2" {
+		t.Fatalf("Get key1 after reopen = (%v, %v), want v2", entry, ok)
+	}
+}
+
+func TestReopenDeleteTombstoneSurvivesCompaction(t *testing.T) {
+	ctx := context.Background()
+	store := objstore.NewMemoryStore()
+
+	db, err := Open(ctx, DBConfig{
+		Store:           store,
+		Prefix:          "test",
+		L0CompactThresh: 2,
+		CompactInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if _, err := db.Put(ctx, "doomed", []byte("v1")); err != nil {
+		t.Fatalf("Put doomed: %v", err)
+	}
+	if err := db.Flush(ctx); err != nil {
+		t.Fatalf("Flush v1: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2, err := Open(ctx, DBConfig{
+		Store:           store,
+		Prefix:          "test",
+		L0CompactThresh: 2,
+		CompactInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+
+	seq, err := db2.Delete(ctx, "doomed")
+	if err != nil {
+		t.Fatalf("Delete doomed: %v", err)
+	}
+	if seq != 2 {
+		t.Fatalf("Delete seq = %d, want 2", seq)
+	}
+	if err := db2.Flush(ctx); err != nil {
+		t.Fatalf("Flush delete: %v", err)
+	}
+	if err := db2.Compact(ctx); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("Close db2: %v", err)
+	}
+
+	db3, err := Open(ctx, DBConfig{
+		Store:           store,
+		Prefix:          "test",
+		L0CompactThresh: 2,
+		CompactInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Reopen after compaction: %v", err)
+	}
+	defer db3.Close()
+
+	entry, ok, err := db3.Get(ctx, "doomed")
+	if err != nil {
+		t.Fatalf("Get doomed: %v", err)
+	}
+	if !ok || entry.Value != nil {
+		t.Fatalf("Get doomed = (%v, %v), want tombstone", entry, ok)
+	}
+}
+
 // TestRecoveryAfterCompactionThenReopen verifies data survives compaction + restart.
 func TestRecoveryAfterCompactionThenReopen(t *testing.T) {
 	ctx := context.Background()

@@ -2,7 +2,9 @@ package moraine
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/russellhaering/moraine/objstore"
 )
@@ -31,11 +33,62 @@ func TestManifestSaveAndLoad(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	if loaded.Version != 1 || loaded.WriterEpoch != 1 || loaded.WALIDNext != 5 {
+	if loaded.Version != 1 || loaded.WriterEpoch != 1 || loaded.WALIDNext != 5 || loaded.LastSeqNum != 10 {
 		t.Fatalf("unexpected manifest: %+v", loaded)
 	}
 	if len(loaded.L0) != 1 || loaded.L0[0].ID != "sst-1" {
 		t.Fatalf("unexpected L0: %+v", loaded.L0)
+	}
+}
+
+func TestManifestLoadLatestBackfillsMissingLastSeqNum(t *testing.T) {
+	ctx := context.Background()
+	store := objstore.NewMemoryStore()
+	ms := NewManifestStore(store, "test")
+
+	oldManifest := []byte(`{
+  "version": 1,
+  "writer_epoch": 1,
+  "compactor_epoch": 0,
+  "wal_id_next": 2,
+  "l0": [
+    {
+      "id": "wal-00000000000000000001",
+      "path": "test/wal/00000000000000000001.sst",
+      "min_key": "a",
+      "max_key": "z",
+      "min_seq": 1,
+      "max_seq": 41,
+      "size": 128
+    }
+  ],
+  "sorted_runs": []
+}`)
+	if err := store.Put(ctx, ms.manifestPath(1), oldManifest, true); err != nil {
+		t.Fatalf("Put old manifest: %v", err)
+	}
+
+	loaded, err := ms.LoadLatest(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatest: %v", err)
+	}
+	if loaded.LastSeqNum != 41 {
+		t.Fatalf("LastSeqNum = %d, want 41", loaded.LastSeqNum)
+	}
+
+	w, err := OpenWriter(ctx, WriterConfig{Store: store, Prefix: "test"})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	if w.seqNum != 41 {
+		t.Fatalf("writer seqNum = %d, want 41", w.seqNum)
+	}
+	seq, err := w.Put(ctx, "new", []byte("value"))
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if seq != 42 {
+		t.Fatalf("Put seq = %d, want 42", seq)
 	}
 }
 
@@ -181,6 +234,62 @@ func TestWriterEpochIncrementsOnReopen(t *testing.T) {
 
 	if epoch2 <= epoch1 {
 		t.Fatalf("expected epoch2 (%d) > epoch1 (%d)", epoch2, epoch1)
+	}
+}
+
+func TestWriterRejectsStaleFlush(t *testing.T) {
+	ctx := context.Background()
+	store := objstore.NewMemoryStore()
+
+	w1, err := OpenWriter(ctx, WriterConfig{Store: store, Prefix: "test"})
+	if err != nil {
+		t.Fatalf("OpenWriter 1: %v", err)
+	}
+
+	w2, err := OpenWriter(ctx, WriterConfig{Store: store, Prefix: "test"})
+	if err != nil {
+		t.Fatalf("OpenWriter 2: %v", err)
+	}
+
+	if _, err := w2.Put(ctx, "winner", []byte("committed")); err != nil {
+		t.Fatalf("w2 Put: %v", err)
+	}
+	if err := w2.Flush(ctx); err != nil {
+		t.Fatalf("w2 Flush: %v", err)
+	}
+
+	if _, err := w1.Put(ctx, "stale", []byte("should-not-commit")); err != nil {
+		t.Fatalf("w1 Put: %v", err)
+	}
+	err = w1.Flush(ctx)
+	if !errors.Is(err, ErrStaleWriter) {
+		t.Fatalf("w1 Flush error = %v, want ErrStaleWriter", err)
+	}
+
+	db, err := Open(ctx, DBConfig{
+		Store:           store,
+		Prefix:          "test",
+		CompactInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Open DB: %v", err)
+	}
+	defer db.Close()
+
+	entry, ok, err := db.Get(ctx, "winner")
+	if err != nil {
+		t.Fatalf("Get winner: %v", err)
+	}
+	if !ok || string(entry.Value) != "committed" {
+		t.Fatalf("Get winner = (%v, %v), want committed", entry, ok)
+	}
+
+	entry, ok, err = db.Get(ctx, "stale")
+	if err != nil {
+		t.Fatalf("Get stale: %v", err)
+	}
+	if ok {
+		t.Fatalf("stale writer data committed unexpectedly: %+v", entry)
 	}
 }
 
