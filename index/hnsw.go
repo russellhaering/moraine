@@ -162,6 +162,11 @@ func (v *VectorIndex) Save(cacheDir, name string) error {
 	return os.WriteFile(filepath.Join(dir, name+".json"), data, 0o644)
 }
 
+// Dimensions returns the vector dimensionality this index expects.
+func (v *VectorIndex) Dimensions() int {
+	return v.dims
+}
+
 // Count returns the approximate number of vectors in the index.
 func (v *VectorIndex) Count() int {
 	v.mu.RLock()

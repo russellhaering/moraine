@@ -129,6 +129,88 @@ func TestTableTextAndVectorSearch(t *testing.T) {
 	}
 }
 
+func TestSetSchemaEmbeddingModelMigrationSkipsStaleVectors(t *testing.T) {
+	ctx := context.Background()
+	schema := &document.Schema{
+		Fields: []document.FieldDefinition{
+			{Name: "title", Type: document.FieldTypeString, FullText: true},
+			{Name: "kind", Type: document.FieldTypeString, Indexed: true},
+		},
+		EmbeddingModel:      "model-a",
+		EmbeddingDimensions: 2,
+	}
+	tbl, cleanup := openIndexedTestTable(t, "model-migration", schema, staticEmbedder{}, t.TempDir())
+	defer cleanup()
+
+	if err := tbl.PutDocument(ctx, &document.Document{
+		ID:         "doc1",
+		Content:    "near-one",
+		Attributes: map[string]any{"title": "Quick fox", "kind": "note"},
+	}); err != nil {
+		t.Fatalf("PutDocument: %v", err)
+	}
+	if err := tbl.WaitForIndexes(ctx); err != nil {
+		t.Fatalf("WaitForIndexes: %v", err)
+	}
+
+	// Sanity: the document is vector-searchable under the original model.
+	preResults, err := tbl.SearchVector(ctx, []float32{1, 0}, 1)
+	if err != nil {
+		t.Fatalf("SearchVector before migration: %v", err)
+	}
+	if len(preResults) != 1 || preResults[0].ID != "doc1" {
+		t.Fatalf("expected doc1 before migration, got %#v", preResults)
+	}
+
+	// Migrate to a different embedding model with different dimensions. The
+	// stored doc1 embedding still has the old (2) dimensions, so replaying it
+	// during the synchronous rebuild must not abort the whole rebuild.
+	newSchema := &document.Schema{
+		Fields: []document.FieldDefinition{
+			{Name: "title", Type: document.FieldTypeString, FullText: true},
+			{Name: "kind", Type: document.FieldTypeString, Indexed: true},
+		},
+		EmbeddingModel:      "model-b",
+		EmbeddingDimensions: 3,
+	}
+	if err := tbl.SetSchema(ctx, newSchema); err != nil {
+		t.Fatalf("SetSchema: %v", err)
+	}
+
+	// The table must not be degraded after the migration.
+	status := tbl.IndexStatus()
+	if !status.Ready || status.Err != nil {
+		t.Fatalf("unexpected index status after migration: %#v", status)
+	}
+
+	// Attribute and full-text search still find the document.
+	attrResults, err := tbl.SearchAttributes(ctx, []index.Filter{{Field: "kind", Op: index.OpEq, Value: "note"}}, 10, 0)
+	if err != nil {
+		t.Fatalf("SearchAttributes after migration: %v", err)
+	}
+	if len(attrResults) != 1 || attrResults[0].ID != "doc1" {
+		t.Fatalf("attribute results after migration = %#v", attrResults)
+	}
+
+	textResults, total, err := tbl.SearchText(ctx, "fox", 10, 0)
+	if err != nil {
+		t.Fatalf("SearchText after migration: %v", err)
+	}
+	if total != 1 || len(textResults) != 1 || textResults[0].ID != "doc1" {
+		t.Fatalf("text results after migration total=%d docs=%#v", total, textResults)
+	}
+
+	// Vector search at the new dimensionality simply does not surface the
+	// stale document (it is not vector-searchable until re-embedded).
+	vecResults, err := tbl.SearchVector(ctx, []float32{1, 0, 0}, 10)
+	if err != nil {
+		t.Fatalf("SearchVector after migration: %v", err)
+	}
+	if len(vecResults) != 0 {
+		t.Fatalf("expected no vector results at new dimensions, got %#v", vecResults)
+	}
+}
+
 func TestTableRestartRebuildsInMemoryAttributeIndex(t *testing.T) {
 	ctx := context.Background()
 	store := objstore.NewMemoryStore()

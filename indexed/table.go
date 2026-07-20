@@ -850,12 +850,23 @@ func (t *Table) applyDoc(doc *document.Document) error {
 		}
 	}
 	if t.vector != nil {
-		if len(doc.Embedding) > 0 {
+		switch {
+		case len(doc.Embedding) == 0:
+			t.vector.Delete(doc.ID)
+		case len(doc.Embedding) != t.vector.Dimensions():
+			// Invariant: the vector index only holds embeddings matching its
+			// configured dimensionality. A document whose stored embedding was
+			// produced by a different model (different dimensions) — e.g. after
+			// SetSchema migrated the embedding model — is not vector-searchable
+			// until it is re-embedded, but it must not abort indexing. Skip the
+			// vector add (dropping any stale vector) while still indexing its
+			// attributes and full-text below. Genuine vector.Add errors are not
+			// swallowed; only this dimension mismatch is tolerated.
+			t.vector.Delete(doc.ID)
+		default:
 			if err := t.vector.Add(doc.ID, doc.Embedding); err != nil {
 				return fmt.Errorf("vector index %q: %w", doc.ID, err)
 			}
-		} else {
-			t.vector.Delete(doc.ID)
 		}
 	}
 	t.attrs.IndexDocument(doc.ID, indexedAttributes(t.schemaSnapshot(), doc.Attributes))
