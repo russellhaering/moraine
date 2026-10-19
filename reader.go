@@ -4,10 +4,10 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"slices"
-
 	"github.com/russellhaering/moraine/cache"
 	"github.com/russellhaering/moraine/objstore"
+	"slices"
+	"strings"
 )
 
 // Reader provides the read path for the LSM tree. It searches active MemTable,
@@ -49,13 +49,11 @@ func (r *Reader) Get(ctx context.Context, key string, active *MemTable, frozen [
 		if err != nil {
 			return nil, false, fmt.Errorf("reader: load L0 %s: %w", sst.ID, err)
 		}
-
 		// Bloom filter check.
 		if !reader.BloomMayContain(key) {
 			continue
 		}
-
-		e, err := reader.Get(key)
+		e, err := reader.Get(ctx, key)
 		if err != nil {
 			return nil, false, fmt.Errorf("reader: get from L0 %s: %w", sst.ID, err)
 		}
@@ -63,7 +61,6 @@ func (r *Reader) Get(ctx context.Context, key string, active *MemTable, frozen [
 			return e, true, nil
 		}
 	}
-
 	// 4. Check sorted runs (newest first).
 	for _, run := range manifest.SortedRuns {
 		for _, sst := range run.SSTables {
@@ -71,17 +68,14 @@ func (r *Reader) Get(ctx context.Context, key string, active *MemTable, frozen [
 			if key < sst.MinKey || key > sst.MaxKey {
 				continue
 			}
-
 			reader, err := r.loadSSTable(ctx, sst)
 			if err != nil {
 				return nil, false, fmt.Errorf("reader: load L%d %s: %w", run.Level, sst.ID, err)
 			}
-
 			if !reader.BloomMayContain(key) {
 				continue
 			}
-
-			e, err := reader.Get(key)
+			e, err := reader.Get(ctx, key)
 			if err != nil {
 				return nil, false, fmt.Errorf("reader: get from L%d %s: %w", run.Level, sst.ID, err)
 			}
@@ -90,32 +84,21 @@ func (r *Reader) Get(ctx context.Context, key string, active *MemTable, frozen [
 			}
 		}
 	}
-
 	return nil, false, nil
 }
 
 // loadSSTable loads an SSTable, checking disk cache first, then object storage.
 func (r *Reader) loadSSTable(ctx context.Context, sst SSTInfo) (*SSTableReader, error) {
-	// Check disk cache.
+	// Check disk cache first.
 	if r.diskCache != nil {
 		data, err := r.diskCache.Get(sst.Path)
 		if err == nil && data != nil {
-			return NewSSTableReader(sst.ID, data)
+			// Use legacy reader for cached full SSTable data.
+			return NewSSTableReaderLegacy(sst.ID, data)
 		}
 	}
-
-	// Load from object storage.
-	data, err := r.store.Get(ctx, sst.Path)
-	if err != nil {
-		return nil, err
-	}
-
-	// Cache on disk for future reads.
-	if r.diskCache != nil {
-		_ = r.diskCache.Put(sst.Path, data)
-	}
-
-	return NewSSTableReader(sst.ID, data)
+	// Load from object storage using ranged reads and block cache.
+	return NewSSTableReader(ctx, r.store, sst.Path, r.blockCache)
 }
 
 // Scan returns all non-tombstone entries in key order across all levels.
@@ -253,7 +236,7 @@ func (r *Reader) ScanRange(ctx context.Context, afterKey string, limit int, acti
 		}
 
 		sources = append(sources, prioritizedIterator{
-			iter:     reader.IteratorFrom(afterKey),
+			iter:     reader.IteratorFrom(ctx, afterKey),
 			priority: priority,
 		})
 		priority++
@@ -273,7 +256,7 @@ func (r *Reader) ScanRange(ctx context.Context, afterKey string, limit int, acti
 			}
 
 			sources = append(sources, prioritizedIterator{
-				iter:     reader.IteratorFrom(afterKey),
+				iter:     reader.IteratorFrom(ctx, afterKey),
 				priority: priority,
 			})
 		}
@@ -399,4 +382,88 @@ func (r *Reader) ScanSince(ctx context.Context, sinceSeq uint64, active *MemTabl
 
 	sortEntries(result)
 	return result, nil
+}
+
+// ScanPrefix returns up to limit non-tombstone entries whose key has the
+// given prefix. Keys are returned in sorted order.
+func (r *Reader) ScanPrefix(ctx context.Context, prefix string, limit int, active *MemTable, frozen []*MemTable, manifest *Manifest) ([]Entry, error) {
+	var sources []prioritizedIterator
+	priority := 0
+
+	// Active MemTable.
+	sources = append(sources, prioritizedIterator{
+		iter:     active.IteratorFrom(prefix),
+		priority: priority,
+	})
+	priority++
+
+	// Frozen MemTables (newest first).
+	for _, mt := range frozen {
+		sources = append(sources, prioritizedIterator{
+			iter:     mt.IteratorFrom(prefix),
+			priority: priority,
+		})
+		priority++
+	}
+
+	// L0 SSTables (newest first).
+	for _, sst := range manifest.L0 {
+		// Skip SSTables entirely if MaxKey < prefix (no keys with this prefix).
+		if sst.MaxKey < prefix {
+			priority++
+			continue
+		}
+		reader, err := r.loadSSTable(ctx, sst)
+		if err != nil {
+			return nil, fmt.Errorf("reader: load L0 %s: %w", sst.ID, err)
+		}
+		sources = append(sources, prioritizedIterator{
+			iter:     reader.IteratorFrom(ctx, prefix),
+			priority: priority,
+		})
+		priority++
+	}
+
+	// Sorted runs (newest first).
+	for _, run := range manifest.SortedRuns {
+		for _, sst := range run.SSTables {
+			// Skip SSTables entirely if MaxKey < prefix.
+			if sst.MaxKey < prefix {
+				continue
+			}
+			reader, err := r.loadSSTable(ctx, sst)
+			if err != nil {
+				return nil, fmt.Errorf("reader: load L%d %s: %w", run.Level, sst.ID, err)
+			}
+			sources = append(sources, prioritizedIterator{
+				iter:     reader.IteratorFrom(ctx, prefix),
+				priority: priority,
+			})
+		}
+		priority++
+	}
+
+	// Merge and collect up to limit+1 entries, filtering by prefix.
+	merge := NewMergeIterator(sources)
+	var entries []Entry
+	for merge.Next() {
+		e := merge.Entry()
+		// Stop when we exceed the prefix range.
+		if !strings.HasPrefix(e.Key, prefix) {
+			break
+		}
+		if e.Value != nil {
+			entries = append(entries, e)
+		}
+		if len(entries) > limit {
+			break
+		}
+	}
+	if err := merge.Err(); err != nil {
+		return nil, fmt.Errorf("reader: merge: %w", err)
+	}
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
 }

@@ -60,19 +60,30 @@ func (m *MemoryStore) GetRange(_ context.Context, key string, offset, length int
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 
-	if offset >= int64(len(data)) {
-		return nil, fmt.Errorf("offset %d beyond object size %d", offset, len(data))
+	dataLen := int64(len(data))
+
+	// Handle negative offset as offset from end (like HTTP Range).
+	if offset < 0 {
+		offset = dataLen + offset
+		if offset < 0 {
+			offset = 0
+		}
+	}
+
+	if offset >= dataLen {
+		return nil, fmt.Errorf("offset %d beyond object size %d", offset, dataLen)
 	}
 
 	end := offset + length
-	if end > int64(len(data)) {
-		end = int64(len(data))
+	if end > dataLen {
+		end = dataLen
 	}
 
 	cp := make([]byte, end-offset)
 	copy(cp, data[offset:end])
 	return cp, nil
-}
+	}
+
 
 func (m *MemoryStore) Head(_ context.Context, key string) (*ObjectMeta, error) {
 	m.mu.RLock()

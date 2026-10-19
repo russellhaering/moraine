@@ -113,7 +113,7 @@ func TestWrite_WithTombstones(t *testing.T) {
 	}
 
 	// Check the tombstone entry via Get.
-	entry, err := reader.Get("dead")
+	entry, err := reader.Get(context.Background(), "dead")
 	if err != nil {
 		t.Fatalf("reader.Get(dead): %v", err)
 	}
@@ -125,7 +125,7 @@ func TestWrite_WithTombstones(t *testing.T) {
 	}
 
 	// Check alive entry has its value.
-	entry, err = reader.Get("alive")
+	entry, err = reader.Get(context.Background(), "alive")
 	if err != nil {
 		t.Fatalf("reader.Get(alive): %v", err)
 	}
@@ -473,7 +473,7 @@ func TestReadWAL_GetIndividualKeys(t *testing.T) {
 		{"bbb", "222"},
 		{"ccc", "333"},
 	} {
-		e, err := reader.Get(tc.key)
+		e, err := reader.Get(context.Background(), tc.key)
 		if err != nil {
 			t.Errorf("Get(%q): %v", tc.key, err)
 			continue
@@ -488,7 +488,7 @@ func TestReadWAL_GetIndividualKeys(t *testing.T) {
 	}
 
 	// Key that doesn't exist.
-	e, err := reader.Get("zzz")
+	e, err := reader.Get(context.Background(), "zzz")
 	if err != nil {
 		t.Errorf("Get(zzz): %v", err)
 	}

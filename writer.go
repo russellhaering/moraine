@@ -1,6 +1,7 @@
 package moraine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -230,6 +231,9 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 		w.currentManifest = newManifest
 		slog.Info("writer flushed", "wal_id", walID, "entries", meta.EntryCount,
 			"manifest_version", newManifest.Version)
+		// The frozen table we just flushed is now durable in the manifest;
+		// drop it to bound memory growth.
+		w.frozen = w.frozen[1:]
 		break
 	}
 
@@ -259,10 +263,131 @@ func (w *Writer) CurrentManifest() *Manifest {
 	return w.currentManifest
 }
 
+// adoptManifest records a manifest written by the compactor so that reads in
+// this process observe compaction results (and stop referencing SSTables the
+// compactor is about to delete). It is a no-op if m is older than what we
+// already hold.
+func (w *Writer) adoptManifest(m *Manifest) {
+	if m == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.currentManifest == nil || m.Version > w.currentManifest.Version {
+		w.currentManifest = m
+	}
+}
+
 // DropFrozen removes all frozen MemTables (called after successful read path
 // initialization ensures L0 SSTables are available).
 func (w *Writer) DropFrozen() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.frozen = nil
+}
+
+// BatchOpType identifies the kind of a BatchOp.
+type BatchOpType int
+
+const (
+	BatchPut BatchOpType = iota
+	BatchDelete
+)
+
+// BatchOp is a single operation in a batch write.
+type BatchOp struct {
+	Type  BatchOpType
+	Key   string
+	Value []byte // ignored for BatchDelete
+}
+
+// WriteBatch applies multiple operations under one lock, so readers never see
+// a partial batch and the batch lands in a single flush. Unknown op types are
+// rejected before anything is applied. Returns a sequence number per op.
+func (w *Writer) WriteBatch(ctx context.Context, ops []BatchOp) ([]uint64, error) {
+	for _, op := range ops {
+		if op.Type != BatchPut && op.Type != BatchDelete {
+			return nil, fmt.Errorf("writer: unknown batch op type: %d", op.Type)
+		}
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if len(ops) == 0 {
+		return nil, nil
+	}
+
+	seqs := make([]uint64, len(ops))
+	for i, op := range ops {
+		w.seqNum++
+		seqs[i] = w.seqNum
+		if op.Type == BatchPut {
+			w.active.Put(op.Key, op.Value, w.seqNum)
+		} else {
+			w.active.Delete(op.Key, w.seqNum)
+		}
+	}
+
+	if w.active.Size() >= w.maxSize {
+		if err := w.flushLocked(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return seqs, nil
+}
+
+// CompareAndSwap sets key to newValue only if its current value equals expected.
+// A nil expected means the key must be absent or deleted (put-if-absent); a nil
+// newValue deletes the key. Only the writer's local state is consulted, which is
+// authoritative in this single-writer design only if the key is also checked
+// against on-disk data, so SSTables are consulted through lookup.
+//
+// lookup is called with w.mu held and receives the current manifest; it must
+// not call back into any Writer method that takes w.mu.
+func (w *Writer) CompareAndSwap(ctx context.Context, key string, expected, newValue []byte, lookup func(ctx context.Context, key string, m *Manifest) (*Entry, bool, error)) (bool, uint64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	e, ok := w.active.Get(key)
+	if !ok {
+		for _, mt := range w.frozen {
+			if e, ok = mt.Get(key); ok {
+				break
+			}
+		}
+	}
+	if !ok {
+		var err error
+		e, ok, err = lookup(ctx, key, w.currentManifest)
+		if err != nil {
+			return false, 0, err
+		}
+	}
+
+	// A tombstone counts as absent.
+	present := ok && e.Value != nil
+	var match bool
+	if expected == nil {
+		match = !present
+	} else {
+		match = present && bytes.Equal(e.Value, expected)
+	}
+	if !match {
+		return false, 0, nil
+	}
+
+	w.seqNum++
+	seq := w.seqNum
+	if newValue == nil {
+		w.active.Delete(key, seq)
+	} else {
+		w.active.Put(key, newValue, seq)
+	}
+
+	if w.active.Size() >= w.maxSize {
+		if err := w.flushLocked(ctx); err != nil {
+			return false, 0, err
+		}
+	}
+	return true, seq, nil
 }

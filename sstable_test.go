@@ -1,8 +1,10 @@
 package moraine
 
 import (
+	"context"
 	"fmt"
 	"testing"
+
 )
 
 func TestWriteReadRoundTrip(t *testing.T) {
@@ -32,7 +34,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Fatalf("expected Size=%d, got %d", len(data), meta.Size)
 	}
 
-	r, err := NewSSTableReader("test-1", data)
+	r, err := NewSSTableReaderLegacy("test-1", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -59,7 +61,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		{"banana", "yellow"},
 		{"cherry", "dark-red"},
 	} {
-		e, err := r.Get(tc.key)
+		e, err := r.Get(context.Background(), tc.key)
 		if err != nil {
 			t.Fatalf("Get(%s): %v", tc.key, err)
 		}
@@ -92,7 +94,7 @@ func TestMultipleDataBlocks(t *testing.T) {
 		t.Fatalf("expected %d entries, got %d", numEntries, meta.EntryCount)
 	}
 
-	r, err := NewSSTableReader("test-multi", data)
+	r, err := NewSSTableReaderLegacy("test-multi", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -106,7 +108,7 @@ func TestMultipleDataBlocks(t *testing.T) {
 	for i := 0; i < numEntries; i++ {
 		key := fmt.Sprintf("key-%05d", i)
 		expected := fmt.Sprintf("value-%05d", i)
-		e, err := r.Get(key)
+		e, err := r.Get(context.Background(), key)
 		if err != nil {
 			t.Fatalf("Get(%s): %v", key, err)
 		}
@@ -132,7 +134,7 @@ func TestGetBinarySearch(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := NewSSTableReader("test-bsearch", data)
+	r, err := NewSSTableReaderLegacy("test-bsearch", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -147,7 +149,7 @@ func TestGetBinarySearch(t *testing.T) {
 		{"charlie", "3"},
 		{"delta", "4"},
 	} {
-		e, err := r.Get(tc.key)
+		e, err := r.Get(context.Background(), tc.key)
 		if err != nil {
 			t.Fatalf("Get(%s): %v", tc.key, err)
 		}
@@ -161,7 +163,7 @@ func TestGetBinarySearch(t *testing.T) {
 
 	// Non-existing keys.
 	for _, key := range []string{"aaa", "az", "echo", "zzz"} {
-		e, err := r.Get(key)
+		e, err := r.Get(context.Background(), key)
 		if err != nil {
 			t.Fatalf("Get(%s): %v", key, err)
 		}
@@ -185,7 +187,7 @@ func TestBloomFilter(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := NewSSTableReader("test-bloom", data)
+	r, err := NewSSTableReaderLegacy("test-bloom", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -229,7 +231,7 @@ func TestSSTableIteratorOrdering(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := NewSSTableReader("test-iter", data)
+	r, err := NewSSTableReaderLegacy("test-iter", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -266,7 +268,7 @@ func TestEmptySSTable(t *testing.T) {
 		t.Fatalf("expected empty key range, got [%s, %s]", meta.MinKey, meta.MaxKey)
 	}
 
-	r, err := NewSSTableReader("test-empty", data)
+	r, err := NewSSTableReaderLegacy("test-empty", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -277,7 +279,7 @@ func TestEmptySSTable(t *testing.T) {
 	}
 
 	// Get on empty table should return nil.
-	e, err := r.Get("anything")
+	e, err := r.Get(context.Background(), "anything")
 	if err != nil {
 		t.Fatalf("Get on empty: %v", err)
 	}
@@ -312,12 +314,12 @@ func TestDuplicateKeysHighestSeqNum(t *testing.T) {
 		t.Fatalf("expected 3 entries, got %d", meta.EntryCount)
 	}
 
-	r, err := NewSSTableReader("test-dup", data)
+	r, err := NewSSTableReaderLegacy("test-dup", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
 
-	e, err := r.Get("key")
+	e, err := r.Get(context.Background(), "key")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -345,7 +347,7 @@ func TestFooterMagicValidation(t *testing.T) {
 	corrupted[len(corrupted)-8] = 0xFF
 	corrupted[len(corrupted)-7] = 0xFF
 
-	_, err = NewSSTableReader("test-magic", corrupted)
+	_, err = NewSSTableReaderLegacy("test-magic", corrupted)
 	if err == nil {
 		t.Fatal("expected error for corrupted magic, got nil")
 	}
@@ -357,12 +359,12 @@ func TestSSTableIteratorFromEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReader("test-from-empty", data)
+	r, err := NewSSTableReaderLegacy("test-from-empty", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
 
-	it := r.IteratorFrom("anything")
+	it := r.IteratorFrom(context.Background(), "anything")
 	if it.Next() {
 		t.Fatal("expected no entries from empty SSTable")
 	}
@@ -378,13 +380,13 @@ func TestSSTableIteratorFromBeginning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReader("test-from-begin", data)
+	r, err := NewSSTableReaderLegacy("test-from-begin", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
 
 	// Empty afterKey should return all entries.
-	it := r.IteratorFrom("")
+	it := r.IteratorFrom(context.Background(), "")
 	count := 0
 	for it.Next() {
 		count++
@@ -408,13 +410,13 @@ func TestSSTableIteratorFromMiddle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReader("test-from-mid", data)
+	r, err := NewSSTableReaderLegacy("test-from-mid", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
 
 	// After "key-00024" should give keys 25..49 (25 entries).
-	it := r.IteratorFrom("key-00024")
+	it := r.IteratorFrom(context.Background(), "key-00024")
 	var got []string
 	for it.Next() {
 		got = append(got, it.Entry().Key)
@@ -443,12 +445,12 @@ func TestSSTableIteratorFromPastEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReader("test-from-past", data)
+	r, err := NewSSTableReaderLegacy("test-from-past", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
 
-	it := r.IteratorFrom("zzz")
+	it := r.IteratorFrom(context.Background(), "zzz")
 	if it.Next() {
 		t.Fatal("expected no entries when afterKey is past all keys")
 	}
@@ -464,13 +466,13 @@ func TestSSTableIteratorFromExactKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReader("test-from-exact", data)
+	r, err := NewSSTableReaderLegacy("test-from-exact", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
 
 	// Exact key match: should NOT include the afterKey itself.
-	it := r.IteratorFrom("key-00005")
+	it := r.IteratorFrom(context.Background(), "key-00005")
 	var got []string
 	for it.Next() {
 		got = append(got, it.Entry().Key)
@@ -488,7 +490,7 @@ func TestSSTableIteratorFromExactKey(t *testing.T) {
 }
 
 func TestDataTooShortForFooter(t *testing.T) {
-	_, err := NewSSTableReader("bad", make([]byte, 10))
+	_, err := NewSSTableReaderLegacy("bad", make([]byte, 10))
 	if err == nil {
 		t.Fatal("expected error for data shorter than footer")
 	}

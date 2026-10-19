@@ -1,12 +1,16 @@
 package moraine
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
 	"sort"
+	"github.com/russellhaering/moraine/cache"
+	"github.com/russellhaering/moraine/objstore"
+
 )
 
 const (
@@ -217,41 +221,47 @@ func (w *SSTableWriter) Finish() ([]byte, SSTableMeta, error) {
 }
 
 // ---------- SSTableReader ----------
-
 // SSTableReader provides read access to a serialized SSTable.
+// It uses ranged reads and an LRU block cache for efficiency.
 type SSTableReader struct {
-	id    string
-	data  []byte
-	index []indexEntry
-	bloom []byte
-	meta  SSTableMeta
+	id          string
+	store       objstore.ObjectStore
+	path        string
+	blockCache  *cache.LRUBlockCache
+	index       []indexEntry
+	bloom       []byte
+	meta        SSTableMeta
+	footerSize  int // cached footer size (48 bytes)
+	data        []byte // for legacy full-buffer reader
 }
 
-// NewSSTableReader parses the footer and index from the raw SSTable bytes.
-func NewSSTableReader(id string, data []byte) (*SSTableReader, error) {
-	if len(data) < footerSize {
+// NewSSTableReader creates a new SSTableReader that loads data on demand via ranged reads.
+// The footer, index, and bloom filter are loaded eagerly; data blocks are fetched
+// lazily and cached in the LRU block cache.
+func NewSSTableReader(ctx context.Context, store objstore.ObjectStore, path string, blockCache *cache.LRUBlockCache) (*SSTableReader, error) {
+	// Read footer (last 48 bytes) to get index/bloom offsets.
+	footerData, err := store.GetRange(ctx, path, -int64(footerSize), footerSize)
+	if err != nil {
+		return nil, fmt.Errorf("sstable: read footer: %w", err)
+	}
+	if len(footerData) < footerSize {
 		return nil, errors.New("sstable: data too short for footer")
 	}
-
-	footer := data[len(data)-footerSize:]
-	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
-	indexSize := binary.LittleEndian.Uint64(footer[8:16])
-	bloomOffset := binary.LittleEndian.Uint64(footer[16:24])
-	bloomSize := binary.LittleEndian.Uint64(footer[24:32])
-	entryCount := binary.LittleEndian.Uint64(footer[32:40])
-	magicVal := binary.LittleEndian.Uint32(footer[40:44])
-
+	indexOffset := binary.LittleEndian.Uint64(footerData[0:8])
+	indexSize := binary.LittleEndian.Uint64(footerData[8:16])
+	bloomOffset := binary.LittleEndian.Uint64(footerData[16:24])
+	bloomSize := binary.LittleEndian.Uint64(footerData[24:32])
+	entryCount := binary.LittleEndian.Uint64(footerData[32:40])
+	magicVal := binary.LittleEndian.Uint32(footerData[40:44])
 	if magicVal != magic {
 		return nil, fmt.Errorf("sstable: bad magic %x", magicVal)
 	}
 
-	dataLen := uint64(len(data))
-	if indexOffset+indexSize > dataLen || bloomOffset+bloomSize > dataLen {
-		return nil, errors.New("sstable: corrupt footer offsets")
+	// Read index block.
+	indexData, err := store.GetRange(ctx, path, int64(indexOffset), int64(indexSize))
+	if err != nil {
+		return nil, fmt.Errorf("sstable: read index: %w", err)
 	}
-
-	// Parse index block.
-	indexData := data[indexOffset : indexOffset+indexSize]
 	var index []indexEntry
 	pos := 0
 	for pos < len(indexData) {
@@ -279,9 +289,167 @@ func NewSSTableReader(id string, data []byte) (*SSTableReader, error) {
 	// Load bloom filter.
 	var bloom []byte
 	if bloomSize > 0 {
-		bloom = data[bloomOffset : bloomOffset+bloomSize]
+		bloom, err = store.GetRange(ctx, path, int64(bloomOffset), int64(bloomSize))
+		if err != nil {
+			return nil, fmt.Errorf("sstable: read bloom: %w", err)
+		}
 	}
 
+	// Compute metadata by scanning entries (we need to read all blocks for this).
+	// For now, we'll do a full scan; this could be optimized later.
+	meta := SSTableMeta{
+		ID:         path, // use path as ID for ranged reads
+		Size:       0, // unknown without HEAD
+		EntryCount: int(entryCount),
+		MinSeq:     math.MaxUint64,
+	}
+	if int(entryCount) == 0 {
+		meta.MinSeq = 0
+	}
+	if len(index) > 0 {
+		// Scan first block for MinKey.
+		firstBlock, err := getBlock(ctx, store, path, blockCache, index[0].Offset, index[0].Size, nil)
+		if err != nil {
+			return nil, fmt.Errorf("sstable: read first block: %w", err)
+		}
+		firstEntry, _, err := decodeEntry(firstBlock, 0)
+		if err == nil {
+			meta.MinKey = firstEntry.Key
+		}
+		// Scan last block for MaxKey.
+		lastIdx := index[len(index)-1]
+		lastBlock, err := getBlock(ctx, store, path, blockCache, lastIdx.Offset, lastIdx.Size, nil)
+		if err != nil {
+			return nil, fmt.Errorf("sstable: read last block: %w", err)
+		}
+		var lastEntry Entry
+		off := 0
+		for off < len(lastBlock) {
+			e, n, err := decodeEntry(lastBlock, off)
+			if err != nil {
+				break
+			}
+			lastEntry = e
+			off += n
+		}
+		meta.MaxKey = lastEntry.Key
+		// Scan all entries for sequence number range.
+		for _, ie := range index {
+			block, err := getBlock(ctx, store, path, blockCache, ie.Offset, ie.Size, nil)
+			if err != nil {
+				return nil, fmt.Errorf("sstable: read block for seq: %w", err)
+			}
+			off := 0
+			for off < len(block) {
+				e, n, err := decodeEntry(block, off)
+				if err != nil {
+					break
+				}
+				if e.SeqNum < meta.MinSeq {
+					meta.MinSeq = e.SeqNum
+				}
+				if e.SeqNum > meta.MaxSeq {
+					meta.MaxSeq = e.SeqNum
+				}
+				off += n
+			}
+		}
+	}
+	return &SSTableReader{
+		id:          path,
+		store:       store,
+		path:        path,
+		blockCache:  blockCache,
+		index:       index,
+		bloom:       bloom,
+		meta:        meta,
+		footerSize:  footerSize,
+	}, nil
+}
+
+// getBlock fetches a data block from the object store, using the LRU cache if available.
+func getBlock(ctx context.Context, store objstore.ObjectStore, path string, blockCache *cache.LRUBlockCache, offset, size uint64, data []byte) ([]byte, error) {
+	key := cache.BlockKey{
+		SSTID:       path,
+		BlockOffset: int64(offset),
+	}
+	if blockCache != nil {
+		if data := blockCache.Get(key); data != nil {
+			return data, nil
+		}
+	}
+	if len(data) > 0 {
+		// Legacy path: use in-memory buffer
+		end := offset + size
+		if end > uint64(len(data)) {
+			end = uint64(len(data))
+		}
+		return data[offset:end], nil
+	}
+	if store == nil {
+		return nil, errors.New("sstable: no store or data for ranged read")
+	}
+	data, err := store.GetRange(ctx, path, int64(offset), int64(size))
+	if err != nil {
+		return nil, err
+	}
+	if blockCache != nil {
+		blockCache.Put(key, data)
+	}
+	return data, nil
+	}
+// ---------- SSTableReader (legacy - kept for compatibility during transition) ----------
+
+// NewSSTableReaderLegacy parses the footer and index from the raw SSTable bytes.
+// This is kept for compatibility with existing code paths (e.g., compaction).
+func NewSSTableReaderLegacy(id string, data []byte) (*SSTableReader, error) {
+	if len(data) < footerSize {
+		return nil, errors.New("sstable: data too short for footer")
+	}
+	footer := data[len(data)-footerSize:]
+	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
+	indexSize := binary.LittleEndian.Uint64(footer[8:16])
+	bloomOffset := binary.LittleEndian.Uint64(footer[16:24])
+	bloomSize := binary.LittleEndian.Uint64(footer[24:32])
+	entryCount := binary.LittleEndian.Uint64(footer[32:40])
+	magicVal := binary.LittleEndian.Uint32(footer[40:44])
+	if magicVal != magic {
+		return nil, fmt.Errorf("sstable: bad magic %x", magicVal)
+	}
+	dataLen := uint64(len(data))
+	if indexOffset+indexSize > dataLen || bloomOffset+bloomSize > dataLen {
+		return nil, errors.New("sstable: corrupt footer offsets")
+	}
+	// Parse index block.
+	indexData := data[indexOffset : indexOffset+indexSize]
+	var index []indexEntry
+	pos := 0
+	for pos < len(indexData) {
+		if pos+4 > len(indexData) {
+			return nil, errors.New("sstable: truncated index entry")
+		}
+		keyLen := int(binary.LittleEndian.Uint32(indexData[pos : pos+4]))
+		pos += 4
+		if pos+keyLen+16 > len(indexData) {
+			return nil, errors.New("sstable: truncated index entry")
+		}
+		firstKey := string(indexData[pos : pos+keyLen])
+		pos += keyLen
+		offset := binary.LittleEndian.Uint64(indexData[pos : pos+8])
+		pos += 8
+		size := binary.LittleEndian.Uint64(indexData[pos : pos+8])
+		pos += 8
+		index = append(index, indexEntry{
+			FirstKey: firstKey,
+			Offset:   offset,
+			Size:     size,
+		})
+	}
+	// Load bloom filter.
+	var bloom []byte
+	if bloomSize > 0 {
+		bloom = data[bloomOffset : bloomOffset+bloomSize]
+	}
 	// Compute metadata by scanning entries.
 	meta := SSTableMeta{
 		ID:         id,
@@ -289,11 +457,9 @@ func NewSSTableReader(id string, data []byte) (*SSTableReader, error) {
 		EntryCount: int(entryCount),
 		MinSeq:     math.MaxUint64,
 	}
-
 	if int(entryCount) == 0 {
 		meta.MinSeq = 0
 	}
-
 	if len(index) > 0 {
 		// Scan first block for MinKey.
 		firstBlock := data[index[0].Offset : index[0].Offset+index[0].Size]
@@ -301,7 +467,6 @@ func NewSSTableReader(id string, data []byte) (*SSTableReader, error) {
 		if err == nil {
 			meta.MinKey = firstEntry.Key
 		}
-
 		// Scan last block for MaxKey.
 		lastIdx := index[len(index)-1]
 		lastBlock := data[lastIdx.Offset : lastIdx.Offset+lastIdx.Size]
@@ -316,7 +481,6 @@ func NewSSTableReader(id string, data []byte) (*SSTableReader, error) {
 			off += n
 		}
 		meta.MaxKey = lastEntry.Key
-
 		// Scan all entries for sequence number range.
 		for _, ie := range index {
 			block := data[ie.Offset : ie.Offset+ie.Size]
@@ -336,17 +500,18 @@ func NewSSTableReader(id string, data []byte) (*SSTableReader, error) {
 			}
 		}
 	}
-
 	return &SSTableReader{
-		id:    id,
-		data:  data,
-		index: index,
-		bloom: bloom,
-		meta:  meta,
+		id:          id,
+		store:       nil, // legacy reader doesn't need store
+		path:        "", // legacy reader doesn't need path
+		blockCache:  nil, // legacy reader doesn't use block cache
+		index:       index,
+		bloom:       bloom,
+		meta:        meta,
+		footerSize:  footerSize,
+		data:        data, // legacy reader uses full buffer
 	}, nil
-}
-
-// Meta returns the SSTable metadata.
+	}
 func (r *SSTableReader) Meta() SSTableMeta {
 	return r.meta
 }
@@ -358,7 +523,7 @@ func (r *SSTableReader) BloomMayContain(key string) bool {
 
 // Get looks up a key using binary search on the index, then scans the data block.
 // Returns nil if the key is not found.
-func (r *SSTableReader) Get(key string) (*Entry, error) {
+func (r *SSTableReader) Get(ctx context.Context, key string) (*Entry, error) {
 	if len(r.index) == 0 {
 		return nil, nil
 	}
@@ -374,7 +539,10 @@ func (r *SSTableReader) Get(key string) (*Entry, error) {
 	}
 
 	ie := r.index[blockIdx]
-	block := r.data[ie.Offset : ie.Offset+ie.Size]
+	block, err := getBlock(ctx, r.store, r.path, r.blockCache, ie.Offset, ie.Size, r.data)
+	if err != nil {
+		return nil, fmt.Errorf("sstable: read block: %w", err)
+	}
 
 	// Scan the block for the key. Return the entry with the highest sequence
 	// number (first occurrence, since entries are sorted by key asc, seqnum desc).
@@ -396,16 +564,29 @@ func (r *SSTableReader) Get(key string) (*Entry, error) {
 			break // Past the target key; no point continuing.
 		}
 	}
-
 	return found, nil
+}
+
+
+type SSTableIterator struct {
+	reader   *SSTableReader
+	ctx      context.Context
+	blockIdx int
+	blockOff int
+	block    []byte // currently loaded data block
+	current  Entry
+	valid    bool
+	err      error
 }
 
 // Iterator returns an iterator over all entries in the SSTable.
 func (r *SSTableReader) Iterator() *SSTableIterator {
 	return &SSTableIterator{
 		reader:   r,
+		ctx:      context.Background(),
 		blockIdx: 0,
 		blockOff: 0,
+		block:    nil,
 	}
 }
 
@@ -413,9 +594,15 @@ func (r *SSTableReader) Iterator() *SSTableIterator {
 // key > afterKey. Uses binary search on the index to find the right block,
 // then scans within the block past afterKey. If afterKey is empty, this
 // behaves identically to Iterator().
-func (r *SSTableReader) IteratorFrom(afterKey string) *SSTableIterator {
+func (r *SSTableReader) IteratorFrom(ctx context.Context, afterKey string) *SSTableIterator {
 	if afterKey == "" || len(r.index) == 0 {
-		return r.Iterator()
+		return &SSTableIterator{
+			reader:   r,
+			ctx:      ctx,
+			blockIdx: 0,
+			blockOff: 0,
+			block:    nil,
+		}
 	}
 
 	// Binary search: find the last block whose FirstKey <= afterKey.
@@ -425,24 +612,35 @@ func (r *SSTableReader) IteratorFrom(afterKey string) *SSTableIterator {
 
 	if blockIdx < 0 {
 		// All blocks have FirstKey > afterKey, so start from the beginning.
-		return r.Iterator()
+		return &SSTableIterator{
+			reader:   r,
+			ctx:      ctx,
+			blockIdx: 0,
+			blockOff: 0,
+			block:    nil,
+		}
 	}
 
-	// Scan within the block to find the first entry with key > afterKey.
+	// Load the block to scan within it.
 	ie := r.index[blockIdx]
-	block := r.data[ie.Offset : ie.Offset+ie.Size]
+	block, err := getBlock(ctx, r.store, r.path, r.blockCache, ie.Offset, ie.Size, r.data)
+	if err != nil {
+		return &SSTableIterator{reader: r, ctx: ctx, blockIdx: len(r.index), err: err}
+	}
 	off := 0
 	for off < len(block) {
 		e, n, err := decodeEntry(block, off)
 		if err != nil {
-			return &SSTableIterator{reader: r, blockIdx: len(r.index), err: err}
+			return &SSTableIterator{reader: r, ctx: ctx, blockIdx: len(r.index), err: err}
 		}
 		if e.Key > afterKey {
 			// Position the iterator here.
 			return &SSTableIterator{
 				reader:   r,
+				ctx:      ctx,
 				blockIdx: blockIdx,
 				blockOff: off,
+				block:    block,
 			}
 		}
 		off += n
@@ -451,31 +649,30 @@ func (r *SSTableReader) IteratorFrom(afterKey string) *SSTableIterator {
 	// All entries in this block have key <= afterKey, start from next block.
 	return &SSTableIterator{
 		reader:   r,
+		ctx:      ctx,
 		blockIdx: blockIdx + 1,
 		blockOff: 0,
+		block:    nil,
 	}
-}
 
-// ---------- SSTableIterator ----------
+	}
 
-// SSTableIterator iterates over SSTable entries in sorted order.
-type SSTableIterator struct {
-	reader   *SSTableReader
-	blockIdx int
-	blockOff int
-	current  Entry
-	valid    bool
-	err      error
-}
-
-// Next advances the iterator to the next entry. Returns false when exhausted.
 func (it *SSTableIterator) Next() bool {
 	for it.blockIdx < len(it.reader.index) {
-		ie := it.reader.index[it.blockIdx]
-		block := it.reader.data[ie.Offset : ie.Offset+ie.Size]
-
-		if it.blockOff < len(block) {
-			e, n, err := decodeEntry(block, it.blockOff)
+		// Load block if not already loaded.
+		if it.block == nil {
+			ie := it.reader.index[it.blockIdx]
+			block, err := getBlock(it.ctx, it.reader.store, it.reader.path, it.reader.blockCache, ie.Offset, ie.Size, it.reader.data)
+			if err != nil {
+				it.err = err
+				it.valid = false
+				return false
+			}
+			it.block = block
+			it.blockOff = 0
+		}
+		if it.blockOff < len(it.block) {
+			e, n, err := decodeEntry(it.block, it.blockOff)
 			if err != nil {
 				it.err = err
 				it.valid = false
@@ -486,9 +683,9 @@ func (it *SSTableIterator) Next() bool {
 			it.valid = true
 			return true
 		}
-
 		// Move to the next block.
 		it.blockIdx++
+		it.block = nil
 		it.blockOff = 0
 	}
 

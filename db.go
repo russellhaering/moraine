@@ -26,6 +26,7 @@ type DB struct {
 	closeOnce sync.Once
 	closeCh   chan struct{}
 	wg        sync.WaitGroup
+	closeErr  error
 }
 
 // DBConfig holds configuration for opening an LSM database.
@@ -78,6 +79,7 @@ func Open(ctx context.Context, cfg DBConfig) (*DB, error) {
 		compactThresh = 4
 	}
 	compactor := NewCompactor(cfg.Store, cfg.Prefix, compactThresh)
+	compactor.onCommit = writer.adoptManifest
 
 	compactInterval := cfg.CompactInterval
 	if compactInterval <= 0 {
@@ -130,6 +132,32 @@ func (db *DB) Flush(ctx context.Context) error {
 	return db.writer.Flush(ctx)
 }
 
+// WriteBatch applies multiple operations atomically under a single lock.
+// All operations land in the same flush. Unknown op types are rejected.
+func (db *DB) WriteBatch(ctx context.Context, ops []BatchOp) ([]uint64, error) {
+	return db.writer.WriteBatch(ctx, ops)
+}
+
+// CompareAndSwap atomically sets key to newValue only if its current value
+// equals expected. A nil expected means put-if-absent; a nil newValue deletes.
+// The lookup function is used to check on-disk SSTables when the key is not
+// found in the writer's local state.
+func (db *DB) CompareAndSwap(ctx context.Context, key string, expected, newValue []byte) (bool, uint64, error) {
+	return db.writer.CompareAndSwap(ctx, key, expected, newValue,
+		func(ctx context.Context, key string, m *Manifest) (*Entry, bool, error) {
+			return db.reader.Get(ctx, key, NewMemTable(), nil, m)
+		})
+}
+
+// ScanPrefix returns up to limit non-tombstone entries whose key has the
+// given prefix. Keys are returned in sorted order.
+func (db *DB) ScanPrefix(ctx context.Context, prefix string, limit int) ([]Entry, error) {
+	active := db.writer.ActiveMemTable()
+	frozen := db.writer.FrozenMemTables()
+	manifest := db.writer.CurrentManifest()
+	return db.reader.ScanPrefix(ctx, prefix, limit, active, frozen, manifest)
+}
+
 // Scan returns all non-tombstone entries in key order.
 func (db *DB) Scan(ctx context.Context) ([]Entry, error) {
 	active := db.writer.ActiveMemTable()
@@ -156,13 +184,16 @@ func (db *DB) ScanSince(ctx context.Context, sinceSeq uint64) ([]Entry, error) {
 	return db.reader.ScanSince(ctx, sinceSeq, active, frozen, manifest)
 }
 
-// Close shuts down the database, stopping background compaction.
+// Close flushes any buffered writes to object storage and shuts down the
+// database, stopping background compaction. It is safe to call more than once;
+// subsequent calls return the result of the first.
 func (db *DB) Close() error {
 	db.closeOnce.Do(func() {
 		close(db.closeCh)
+		db.wg.Wait()
+		db.closeErr = db.writer.Flush(context.Background())
 	})
-	db.wg.Wait()
-	return nil
+	return db.closeErr
 }
 
 func (db *DB) compactLoop() {

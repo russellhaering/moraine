@@ -162,8 +162,28 @@ func (s *S3Store) Get(ctx context.Context, key string) ([]byte, error) {
 	return io.ReadAll(output.Body)
 }
 
+// rangeHeader builds an HTTP Range header value. A negative offset requests
+// the last -offset bytes of the object (a suffix range, "bytes=-N"), matching
+// MemoryStore.GetRange semantics. A suffix read must cover the whole suffix
+// (length >= -offset); anything else cannot be expressed in one header.
+func rangeHeader(offset, length int64) (string, error) {
+	if length <= 0 {
+		return "", fmt.Errorf("s3 get range: invalid length %d", length)
+	}
+	if offset < 0 {
+		if length < -offset {
+			return "", fmt.Errorf("s3 get range: partial suffix read (offset %d, length %d) not supported", offset, length)
+		}
+		return fmt.Sprintf("bytes=-%d", -offset), nil
+	}
+	return fmt.Sprintf("bytes=%d-%d", offset, offset+length-1), nil
+}
+
 func (s *S3Store) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
-	rangeStr := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	rangeStr, err := rangeHeader(offset, length)
+	if err != nil {
+		return nil, err
+	}
 	output, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.fullKey(key)),
