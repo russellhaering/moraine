@@ -18,8 +18,10 @@ The code was extracted from WasmDB and is intentionally boring inside: MemTables
 - Read path over active MemTable, frozen MemTables, L0 SSTables, and sorted runs.
 - Cursor-style range scans with `ScanRange`.
 - Sequence-number tailing with `ScanSince`.
+- Atomic batches (`WriteBatch`), `CompareAndSwap`, and `ScanPrefix`.
 - Optional document/index layer with attribute, full-text, and vector search.
-- In-memory block cache and optional disk SSTable cache.
+- Optional filesystem layer with content-addressed blobs, namespaces for checkpoints and forks, and diff/merge.
+- In-memory block cache and optional disk block cache, shareable across databases.
 - Apache-2.0 licensed.
 
 ## Status
@@ -32,7 +34,7 @@ Important current constraints:
 - The `indexed` package provides a higher-level document API when you want built-in serialization and indexes.
 - Keys are strings and sort lexicographically.
 - A database prefix is intended to have one active writer.
-- There are no multi-key transactions.
+- `WriteBatch` applies several writes atomically, but there are no read-write transactions; with one writer, read-then-write sequences need the caller's own locking.
 - Object-store consistency and conditional-write semantics matter for correctness.
 
 ## Install
@@ -92,6 +94,7 @@ Moraine is organized as opt-in layers:
 
 - `moraine`: the embedded object-storage-backed sorted key/value store.
 - `indexed`: an embedded document table backed by `moraine.DB` with derived indexes.
+- `vfs`: a hierarchical filesystem backed by `moraine.DB`, with large file contents stored as content-addressed blobs.
 - The future HTTP/server layer should build on the indexed layer rather than changing the raw KV API.
 
 The indexed layer treats Moraine as the durable source of truth. Attribute, full-text, and vector indexes are derived state. Writes enqueue indexing work asynchronously; call `WaitForIndexes(ctx)` when a search must observe all writes accepted before that call.
@@ -137,6 +140,36 @@ if err != nil {
 	return err
 }
 _ = docs
+```
+
+The vfs layer stores file metadata, and files smaller than `InlineThreshold`, in the database; larger contents are stored once per distinct content under `BlobPrefix`. A namespace is a complete file tree, and forking one copies only metadata, so namespaces serve as checkpoints, isolated working copies, and forks. `Diff` and `Apply` merge changes between namespaces. Changes are durable once the database is flushed.
+
+```go
+store, err := vfs.Open(db, vfs.Options{Blobs: objectStore, BlobPrefix: "agents/a1/blobs"})
+if err != nil {
+	return err
+}
+main, _ := store.FS("main")
+if err := main.MkdirAll(ctx, "notes", 0o755); err != nil {
+	return err
+}
+if err := main.WriteFile(ctx, "notes/plan.md", []byte("# Plan"), 0o644); err != nil {
+	return err
+}
+
+// Checkpoint, work in an isolated copy, then merge the changes back.
+_ = store.Fork(ctx, "main", "ckpt-1")
+_ = store.Fork(ctx, "main", "worker")
+// ... the worker edits its namespace ...
+changes, _ := store.Diff(ctx, "main", "worker")
+paths := make([]string, len(changes))
+for i, c := range changes {
+	paths[i] = c.Path
+}
+_ = store.Apply(ctx, "worker", "main", paths)
+
+// main.IOFS(ctx) is an fs.FS, so fs.WalkDir and fs.Glob work on it.
+// Run store.CollectGarbage periodically to delete unreferenced blobs.
 ```
 
 ## S3-backed storage
