@@ -164,6 +164,25 @@ db, err := moraine.Open(ctx, moraine.DBConfig{
 
 `Endpoint` can be set in `objstore.S3Config` for S3-compatible services such as MinIO.
 
+## Many databases in one process
+
+Each database normally runs its own background goroutine that checks object storage for compaction work every `CompactInterval`, and owns its own caches. To host many small databases (for example, one per tenant), share caches and a compaction pool instead:
+
+```go
+pool := moraine.NewCompactionPool(4) // workers shared by every database
+blocks := cache.NewLRUBlockCache(1 << 30)
+
+db, err := moraine.Open(ctx, moraine.DBConfig{
+	Store:          store,
+	Prefix:         "tenants/" + tenantID,
+	BlockCache:     blocks,
+	CompactionPool: pool,
+	CompactOnClose: true, // compact L0 on Close so the next Open reads less
+})
+```
+
+A database on a pool makes no object-storage requests while idle: it is queued for compaction when a flush leaves it at its L0 threshold, and for garbage collection when replaced SSTables come due for deletion. Databases sharing a cache must use distinct prefixes. Close every database before closing the pool.
+
 ## Cloudflare R2-backed storage
 
 Cloudflare R2 works through the S3-compatible implementation. R2 uses an account-scoped endpoint and the S3 region `auto`.

@@ -22,6 +22,7 @@ type countingStore struct {
 	mu     sync.Mutex
 	gets   int
 	ranges int
+	lists  int
 	// failPut, if set, is consulted before each Put. Returning
 	// (err, true) fails the put; applyFirst also stores the object first,
 	// simulating a write that landed but whose response was lost.
@@ -44,6 +45,13 @@ func (s *countingStore) GetRange(ctx context.Context, key string, offset, length
 	s.ranges++
 	s.mu.Unlock()
 	return s.MemoryStore.GetRange(ctx, key, offset, length)
+}
+
+func (s *countingStore) List(ctx context.Context, prefix string) ([]string, error) {
+	s.mu.Lock()
+	s.lists++
+	s.mu.Unlock()
+	return s.MemoryStore.List(ctx, prefix)
 }
 
 func (s *countingStore) Put(ctx context.Context, key string, data []byte, ifNoneMatch bool) error {
@@ -69,7 +77,7 @@ func (s *countingStore) reads() (gets, ranges int) {
 
 func (s *countingStore) resetReads() {
 	s.mu.Lock()
-	s.gets, s.ranges = 0, 0
+	s.gets, s.ranges, s.lists = 0, 0, 0
 	s.mu.Unlock()
 }
 

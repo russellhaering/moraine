@@ -22,6 +22,8 @@ type DB struct {
 
 	compactInterval time.Duration
 	compactThresh   int
+	pool            *CompactionPool
+	compactOnClose  bool
 
 	closeOnce sync.Once
 	closeCh   chan struct{}
@@ -45,7 +47,17 @@ type DBConfig struct {
 	BlockCache      *cache.LRUBlockCache
 	DiskCache       *cache.DiskCache
 	L0CompactThresh int
+	// CompactInterval is how often a database without a CompactionPool
+	// checks whether to compact. It is unused with a pool.
 	CompactInterval time.Duration
+	// CompactionPool, when set, runs this database's compaction and garbage
+	// collection on the pool's shared workers instead of a polling goroutine
+	// per database.
+	CompactionPool *CompactionPool
+	// CompactOnClose makes Close merge every L0 SSTable into the sorted runs
+	// after its final flush, so the next Open reads fewer SSTables at the
+	// cost of a slower Close.
+	CompactOnClose bool
 }
 
 // Open opens an LSM database.
@@ -105,12 +117,23 @@ func Open(ctx context.Context, cfg DBConfig) (*DB, error) {
 		prefix:          cfg.Prefix,
 		compactInterval: compactInterval,
 		compactThresh:   compactThresh,
+		pool:            cfg.CompactionPool,
+		compactOnClose:  cfg.CompactOnClose,
 		closeCh:         make(chan struct{}),
 	}
 
 	// Start background compaction.
-	db.wg.Add(1)
-	go db.compactLoop()
+	if db.pool != nil {
+		writer.onFlush = func(l0 int) {
+			if l0 >= compactThresh {
+				db.pool.trigger(compactor, l0)
+			}
+		}
+		db.pool.register(compactor, len(writer.CurrentManifest().L0))
+	} else {
+		db.wg.Add(1)
+		go db.compactLoop()
+	}
 
 	return db, nil
 }
@@ -196,13 +219,21 @@ func (db *DB) ScanSince(ctx context.Context, sinceSeq uint64) ([]Entry, error) {
 }
 
 // Close flushes any buffered writes to object storage and shuts down the
-// database, stopping background compaction. It is safe to call more than once;
-// subsequent calls return the result of the first.
+// database, stopping background compaction. With CompactOnClose it then
+// compacts every L0 SSTable. It is safe to call more than once; subsequent
+// calls return the result of the first.
 func (db *DB) Close() error {
 	db.closeOnce.Do(func() {
+		if db.pool != nil {
+			db.pool.unregister(db.compactor)
+		}
 		close(db.closeCh)
 		db.wg.Wait()
-		db.closeErr = db.writer.Flush(context.Background())
+		ctx := context.Background()
+		db.closeErr = db.writer.Flush(ctx)
+		if db.closeErr == nil && db.compactOnClose {
+			db.closeErr = db.compactor.CompactAll(ctx)
+		}
 	})
 	return db.closeErr
 }

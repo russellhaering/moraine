@@ -34,6 +34,11 @@ type Compactor struct {
 	gcGrace time.Duration
 	now     func() time.Time
 
+	// runMu serializes compaction runs. Two overlapping compactions of the
+	// same database would each rebuild the first sorted run from their own
+	// snapshot, and the later commit would drop the earlier one's output.
+	runMu sync.Mutex
+
 	gcMu    sync.Mutex
 	pending []pendingDelete
 	// orphansQueued records that this compactor has scanned object storage
@@ -65,6 +70,9 @@ func NewCompactor(store objstore.ObjectStore, prefix string, threshold int) *Com
 // DefaultGCGracePeriod is how long replaced SSTables are retained before
 // deletion when no grace period is configured.
 const DefaultGCGracePeriod = 10 * time.Minute
+
+// gcRetryDelay is how long a failed delete waits before it is retried.
+const gcRetryDelay = time.Minute
 
 // scheduleDelete queues paths for deletion once the grace period elapses.
 func (c *Compactor) scheduleDelete(paths []string) {
@@ -102,7 +110,7 @@ func (c *Compactor) sweep(ctx context.Context) {
 	m, err := c.manifest.LoadLatest(ctx)
 	if err != nil {
 		slog.Warn("compactor: load manifest for gc", "err", err)
-		c.requeue(due)
+		c.requeue(due, now.Add(gcRetryDelay))
 		return
 	}
 	live := referencedPaths(m)
@@ -117,16 +125,33 @@ func (c *Compactor) sweep(ctx context.Context) {
 			failed = append(failed, p)
 		}
 	}
-	c.requeue(failed)
+	c.requeue(failed, now.Add(gcRetryDelay))
 }
 
-func (c *Compactor) requeue(ps []pendingDelete) {
+// requeue puts deletes back on the queue to be retried at the given time.
+func (c *Compactor) requeue(ps []pendingDelete, at time.Time) {
 	if len(ps) == 0 {
 		return
 	}
 	c.gcMu.Lock()
-	c.pending = append(c.pending, ps...)
-	c.gcMu.Unlock()
+	defer c.gcMu.Unlock()
+	for _, p := range ps {
+		p.deleteAt = at
+		c.pending = append(c.pending, p)
+	}
+}
+
+// nextDeleteAt returns when the earliest queued delete becomes due.
+func (c *Compactor) nextDeleteAt() (time.Time, bool) {
+	c.gcMu.Lock()
+	defer c.gcMu.Unlock()
+	var next time.Time
+	for _, p := range c.pending {
+		if next.IsZero() || p.deleteAt.Before(next) {
+			next = p.deleteAt
+		}
+	}
+	return next, !next.IsZero()
 }
 
 // referencedPaths returns the object paths of every SSTable m references.
@@ -216,15 +241,14 @@ func (c *Compactor) mayBeInFlight(key string, m *Manifest) bool {
 
 // MaybeCompact checks if compaction is needed and performs it.
 func (c *Compactor) MaybeCompact(ctx context.Context) error {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+
 	c.sweep(ctx)
 
-	m, err := c.manifest.LoadLatest(ctx)
+	m, err := c.loadOwned(ctx)
 	if err != nil || m == nil {
 		return err
-	}
-
-	if c.epoch != 0 && m.WriterEpoch != c.epoch {
-		return fmt.Errorf("compactor: epoch %d superseded by epoch %d: %w", c.epoch, m.WriterEpoch, ErrStaleWriter)
 	}
 
 	c.gcMu.Lock()
@@ -245,6 +269,32 @@ func (c *Compactor) MaybeCompact(ctx context.Context) error {
 	}
 
 	return c.compact(ctx, m)
+}
+
+// CompactAll merges every L0 SSTable into the sorted runs regardless of the
+// threshold, so a database reopened later reads as few SSTables as possible.
+func (c *Compactor) CompactAll(ctx context.Context) error {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+
+	m, err := c.loadOwned(ctx)
+	if err != nil || m == nil || len(m.L0) == 0 {
+		return err
+	}
+	return c.compact(ctx, m)
+}
+
+// loadOwned loads the latest manifest and checks that this compactor's writer
+// still owns the database.
+func (c *Compactor) loadOwned(ctx context.Context) (*Manifest, error) {
+	m, err := c.manifest.LoadLatest(ctx)
+	if err != nil || m == nil {
+		return nil, err
+	}
+	if c.epoch != 0 && m.WriterEpoch != c.epoch {
+		return nil, fmt.Errorf("compactor: epoch %d superseded by epoch %d: %w", c.epoch, m.WriterEpoch, ErrStaleWriter)
+	}
+	return m, nil
 }
 
 func (c *Compactor) compact(ctx context.Context, m *Manifest) error {

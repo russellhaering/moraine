@@ -34,6 +34,11 @@ type Writer struct {
 	maxSize int64
 
 	currentManifest *Manifest
+
+	// onFlush, if set, is called with the L0 SSTable count after a flush
+	// commits. It runs with w.mu held and must not block or call back into
+	// the writer.
+	onFlush func(l0 int)
 }
 
 // WriterConfig configures the writer.
@@ -165,11 +170,16 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 	// Flush oldest first so L0 stays newest-first. A table left behind by an
 	// earlier failed flush is retried here before anything newer, and stays
 	// readable from w.frozen until it is durable.
+	flushed := false
 	for len(w.frozen) > 0 {
 		if err := w.flushTable(ctx, w.frozen[len(w.frozen)-1]); err != nil {
 			return err
 		}
 		w.frozen = w.frozen[:len(w.frozen)-1]
+		flushed = true
+	}
+	if flushed && w.onFlush != nil {
+		w.onFlush(len(w.currentManifest.L0))
 	}
 	return nil
 }
