@@ -450,3 +450,26 @@ func TestDBScanRangeAfterCompaction(t *testing.T) {
 		}
 	}
 }
+
+func TestSizeBytes(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, DBConfig{Store: objstore.NewMemoryStore(), Prefix: "size", CompactInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if n := db.SizeBytes(); n != 0 {
+		t.Fatalf("empty database size = %d", n)
+	}
+	db.Put(ctx, "k", make([]byte, 1000))
+	inMemory := db.SizeBytes()
+	if inMemory < 1000 {
+		t.Fatalf("size with an unflushed 1000-byte value = %d", inMemory)
+	}
+	if err := db.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if flushed := db.SizeBytes(); flushed < 1000 {
+		t.Fatalf("size after flush = %d", flushed)
+	}
+}

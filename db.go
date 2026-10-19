@@ -223,6 +223,28 @@ func (db *DB) ScanSince(ctx context.Context, sinceSeq uint64) ([]Entry, error) {
 	return db.reader.ScanSince(ctx, sinceSeq, active, frozen, manifest)
 }
 
+// SizeBytes estimates the database's size: the bytes of every SSTable the
+// current manifest references plus the MemTables not yet flushed. Replaced
+// SSTables awaiting garbage collection are not counted.
+func (db *DB) SizeBytes() int64 {
+	var n int64
+	if m := db.writer.CurrentManifest(); m != nil {
+		for _, sst := range m.L0 {
+			n += sst.Size
+		}
+		for _, run := range m.SortedRuns {
+			for _, sst := range run.SSTables {
+				n += sst.Size
+			}
+		}
+	}
+	n += db.writer.ActiveMemTable().Size()
+	for _, mt := range db.writer.FrozenMemTables() {
+		n += mt.Size()
+	}
+	return n
+}
+
 // Close flushes any buffered writes to object storage and shuts down the
 // database, stopping background compaction. With CompactOnClose it then
 // compacts every L0 SSTable. It is safe to call more than once; subsequent
