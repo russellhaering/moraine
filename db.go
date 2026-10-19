@@ -58,6 +58,10 @@ type DBConfig struct {
 	// after its final flush, so the next Open reads fewer SSTables at the
 	// cost of a slower Close.
 	CompactOnClose bool
+	// TargetSSTableSize is the approximate size at which compaction cuts
+	// sorted-run SSTables, so a compaction rewrites only the key ranges new
+	// data touches. Zero means DefaultTargetSSTableSize (64 MiB).
+	TargetSSTableSize int64
 }
 
 // Open opens an LSM database.
@@ -103,6 +107,7 @@ func Open(ctx context.Context, cfg DBConfig) (*DB, error) {
 	compactor := NewCompactor(cfg.Store, cfg.Prefix, compactThresh)
 	compactor.onCommit = writer.adoptManifest
 	compactor.epoch = writer.epoch
+	compactor.targetSSTableSize = cfg.TargetSSTableSize
 
 	compactInterval := cfg.CompactInterval
 	if compactInterval <= 0 {
