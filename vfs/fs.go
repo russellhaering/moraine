@@ -1,7 +1,9 @@
 package vfs
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"io/fs"
 	"strings"
 
@@ -133,7 +135,7 @@ func (f *FS) WriteFile(ctx context.Context, name string, data []byte, perm fs.Fi
 	parent, _ := split(name)
 
 	// Fail fast before uploading, then check again under the lock.
-	if err := f.checkWritable(ctx, name, parent); err != nil {
+	if err := f.checkWritable(ctx, "write", name, parent); err != nil {
 		return err
 	}
 	n, err := f.s.newFileInode(ctx, data, perm)
@@ -143,7 +145,7 @@ func (f *FS) WriteFile(ctx context.Context, name string, data []byte, perm fs.Fi
 
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
-	if err := f.checkWritable(ctx, name, parent); err != nil {
+	if err := f.checkWritable(ctx, "write", name, parent); err != nil {
 		return err
 	}
 	return f.commit(ctx, "write", name, []moraine.BatchOp{
@@ -151,16 +153,154 @@ func (f *FS) WriteFile(ctx context.Context, name string, data []byte, perm fs.Fi
 	})
 }
 
-func (f *FS) checkWritable(ctx context.Context, name, parent string) error {
-	if err := f.requireDir(ctx, "write", parent); err != nil {
+// Create returns a writer that replaces the named file, creating it with
+// perm if necessary. Its parent directory must exist. The writer buffers at
+// most one chunk, uploading each full chunk as it fills, so files of any size
+// can be written in constant memory. Nothing is visible until Close commits
+// the file, atomically replacing any previous contents; a writer that is
+// abandoned without Close leaves only unreferenced blobs for CollectGarbage.
+// A Writer is not safe for concurrent use.
+func (f *FS) Create(ctx context.Context, name string, perm fs.FileMode) (io.WriteCloser, error) {
+	name, err := cleanPath("write", name)
+	if err != nil {
+		return nil, err
+	}
+	if name == "." {
+		return nil, &fs.PathError{Op: "write", Path: name, Err: ErrIsDir}
+	}
+	parent, _ := split(name)
+	if err := f.checkWritable(ctx, "write", name, parent); err != nil {
+		return nil, err
+	}
+	return &fileWriter{f: f, ctx: ctx, name: name, parent: parent, perm: perm, c: f.s.newChunker(ctx)}, nil
+}
+
+type fileWriter struct {
+	f      *FS
+	ctx    context.Context
+	name   string
+	parent string
+	perm   fs.FileMode
+	c      *chunker
+	err    error // first write error; the file cannot be committed
+	closed bool
+}
+
+func (w *fileWriter) Write(p []byte) (int, error) {
+	if w.closed {
+		return 0, &fs.PathError{Op: "write", Path: w.name, Err: fs.ErrClosed}
+	}
+	if w.err != nil {
+		return 0, w.err
+	}
+	if err := w.c.write(p); err != nil {
+		w.err = &fs.PathError{Op: "write", Path: w.name, Err: err}
+		return 0, w.err
+	}
+	return len(p), nil
+}
+
+// Close uploads the final chunk and commits the file.
+func (w *fileWriter) Close() error {
+	if w.closed {
+		return &fs.PathError{Op: "write", Path: w.name, Err: fs.ErrClosed}
+	}
+	w.closed = true
+	if w.err != nil {
+		return w.err
+	}
+	n, err := w.c.finish(w.perm)
+	if err != nil {
+		return &fs.PathError{Op: "write", Path: w.name, Err: err}
+	}
+	w.f.s.mu.Lock()
+	defer w.f.s.mu.Unlock()
+	if err := w.f.checkWritable(w.ctx, "write", w.name, w.parent); err != nil {
+		return err
+	}
+	return w.f.commit(w.ctx, "write", w.name, []moraine.BatchOp{
+		{Type: moraine.BatchPut, Key: w.f.s.entryKey(w.f.ns, w.name), Value: encodeInode(n)},
+	})
+}
+
+// Append adds data to the end of the named file, creating it with mode 0644
+// if it does not exist. Its parent directory must exist. Appending to a
+// chunked file re-uploads only its last chunk, extended by data, and any new
+// chunks; the file's other chunks are untouched and never read. An inline
+// file that grows past the inline threshold becomes chunked. (A file stored
+// as a single legacy blob is read once and rewritten as chunks.) Concurrent
+// appends are serialized by retrying on conflict, so none is lost.
+func (f *FS) Append(ctx context.Context, name string, data []byte) error {
+	name, err := cleanPath("append", name)
+	if err != nil {
+		return err
+	}
+	if name == "." {
+		return &fs.PathError{Op: "append", Path: name, Err: ErrIsDir}
+	}
+	parent, _ := split(name)
+	key := f.s.entryKey(f.ns, name)
+	for {
+		if err := f.checkWritable(ctx, "append", name, parent); err != nil {
+			return err
+		}
+		// Upload outside the lock against the entry as it is now, then
+		// commit only if the entry is still byte-for-byte the same.
+		old, err := f.rawEntry(ctx, key)
+		if err != nil {
+			return &fs.PathError{Op: "append", Path: name, Err: err}
+		}
+		var cur *inode
+		if old != nil {
+			if cur, err = decodeInode(old); err != nil {
+				return &fs.PathError{Op: "append", Path: name, Err: err}
+			}
+		}
+		if cur != nil && len(data) == 0 {
+			return nil
+		}
+		n, err := f.s.appendInode(ctx, cur, data)
+		if err != nil {
+			return &fs.PathError{Op: "append", Path: name, Err: err}
+		}
+
+		f.s.mu.Lock()
+		now, err := f.rawEntry(ctx, key)
+		if err == nil && bytes.Equal(now, old) {
+			if err = f.checkWritable(ctx, "append", name, parent); err == nil {
+				err = f.commit(ctx, "append", name, []moraine.BatchOp{
+					{Type: moraine.BatchPut, Key: key, Value: encodeInode(n)},
+				})
+			}
+			f.s.mu.Unlock()
+			return err
+		}
+		f.s.mu.Unlock()
+		if err != nil {
+			return &fs.PathError{Op: "append", Path: name, Err: err}
+		}
+	}
+}
+
+// rawEntry returns the stored bytes of an entry, or nil if absent.
+func (f *FS) rawEntry(ctx context.Context, key string) ([]byte, error) {
+	e, ok, err := f.s.db.Get(ctx, key)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return e.Value, nil
+}
+
+func (f *FS) checkWritable(ctx context.Context, op, name, parent string) error {
+	if err := f.requireDir(ctx, op, parent); err != nil {
 		return err
 	}
 	existing, err := f.s.get(ctx, f.ns, name)
 	if err != nil {
-		return &fs.PathError{Op: "write", Path: name, Err: err}
+		return &fs.PathError{Op: op, Path: name, Err: err}
 	}
 	if existing != nil && existing.isDir() {
-		return &fs.PathError{Op: "write", Path: name, Err: ErrIsDir}
+		return &fs.PathError{Op: op, Path: name, Err: ErrIsDir}
 	}
 	return nil
 }

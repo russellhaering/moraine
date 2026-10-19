@@ -97,8 +97,8 @@ func (s *Store) referencedBlobs(ctx context.Context) (map[string]struct{}, error
 		if err != nil {
 			return nil, err
 		}
-		if n.Blob {
-			refs[n.Hash] = struct{}{}
+		for _, h := range n.blobHashes() {
+			refs[h] = struct{}{}
 		}
 	}
 	return refs, nil

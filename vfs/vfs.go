@@ -5,8 +5,10 @@
 // a namespace copies only metadata, so namespaces serve as checkpoints,
 // isolated scratch copies, and forks; Diff and Apply merge changes between
 // them. Files smaller than Options.InlineThreshold are stored in the database
-// itself; larger ones are stored once per distinct content under
-// Options.BlobPrefix and shared by every namespace that references them.
+// itself; larger ones are split into chunks of Options.ChunkSize, each stored
+// once per distinct content under Options.BlobPrefix and shared by every
+// namespace that references it. Large files can be written as a stream
+// (FS.Create) and extended in place (FS.Append) without rewriting them.
 //
 // Each FS method is atomic. Changes become durable when the database is
 // flushed; blobs are uploaded before the metadata that references them is
@@ -37,6 +39,10 @@ const (
 	// are stored as blobs rather than in the database.
 	DefaultInlineThreshold = 64 << 10
 
+	// DefaultChunkSize is the size of the chunks that large files are split
+	// into.
+	DefaultChunkSize = 4 << 20
+
 	// DefaultGCGrace is how long a blob must stay unreferenced, and unused by
 	// any write, before CollectGarbage deletes it.
 	DefaultGCGrace = 10 * time.Minute
@@ -64,6 +70,11 @@ type Options struct {
 	KeyPrefix string
 	// InlineThreshold defaults to DefaultInlineThreshold.
 	InlineThreshold int
+	// ChunkSize is the size of the blobs a large file is split into; every
+	// chunk but a file's last has exactly this size. Defaults to
+	// DefaultChunkSize. It may change between opens: existing files keep
+	// their chunks.
+	ChunkSize int
 	// GCGrace defaults to DefaultGCGrace.
 	GCGrace time.Duration
 	// Now overrides the clock, for tests.
@@ -77,6 +88,7 @@ type Store struct {
 	blobPrefix string
 	prefix     string
 	inline     int
+	chunkSize  int
 	grace      time.Duration
 	now        func() time.Time
 
@@ -103,6 +115,7 @@ func Open(db *moraine.DB, opts Options) (*Store, error) {
 		blobPrefix: strings.TrimSuffix(opts.BlobPrefix, "/") + "/",
 		prefix:     opts.KeyPrefix,
 		inline:     opts.InlineThreshold,
+		chunkSize:  opts.ChunkSize,
 		grace:      opts.GCGrace,
 		now:        opts.Now,
 		firstUnref: map[string]time.Time{},
@@ -112,6 +125,9 @@ func Open(db *moraine.DB, opts Options) (*Store, error) {
 	}
 	if s.inline <= 0 {
 		s.inline = DefaultInlineThreshold
+	}
+	if s.chunkSize <= 0 {
+		s.chunkSize = DefaultChunkSize
 	}
 	if s.grace <= 0 {
 		s.grace = DefaultGCGrace
@@ -187,7 +203,14 @@ type inode struct {
 	ModTime int64       `json:"mtime,omitempty"` // Unix nanoseconds
 	Hash    string      `json:"hash,omitempty"`  // SHA-256 of file contents
 	Data    []byte      `json:"data,omitempty"`  // inline contents
-	Blob    bool        `json:"blob,omitempty"`  // contents are the blob named Hash
+	// Blob marks a legacy entry whose contents are the single blob named
+	// Hash. New entries use Chunks instead; Blob entries remain readable.
+	Blob bool `json:"blob,omitempty"`
+	// Chunks lists the blobs holding a large file's contents, in order.
+	Chunks []chunkRef `json:"chunks,omitempty"`
+	// HashState is the SHA-256 state after every chunk but the last; see
+	// chunks.go.
+	HashState []byte `json:"hstate,omitempty"`
 }
 
 func (n *inode) isDir() bool { return n.Mode.IsDir() }
@@ -286,15 +309,19 @@ func hashContent(data []byte) string {
 
 func (s *Store) blobKey(hash string) string { return s.blobPrefix + hash }
 
+// holdBlob restarts a blob's garbage-collection grace period.
+func (s *Store) holdBlob(hash string) {
+	s.blobMu.Lock()
+	delete(s.firstUnref, hash)
+	s.blobMu.Unlock()
+}
+
 // putBlob uploads data under its hash unless it is already present. It first
 // restarts the blob's garbage-collection grace period, so the blob cannot be
 // deleted between the existence check and the metadata write that
 // references it.
 func (s *Store) putBlob(ctx context.Context, hash string, data []byte) error {
-	s.blobMu.Lock()
-	delete(s.firstUnref, hash)
-	s.blobMu.Unlock()
-
+	s.holdBlob(hash)
 	err := s.blobs.Put(ctx, s.blobKey(hash), data, true)
 	if errors.Is(err, objstore.ErrPreconditionFailed) {
 		return nil // already stored; content addressing makes it identical
@@ -307,37 +334,63 @@ func (s *Store) putBlob(ctx context.Context, hash string, data []byte) error {
 
 // contents returns a file's full contents.
 func (s *Store) contents(ctx context.Context, n *inode) ([]byte, error) {
-	if !n.Blob {
+	refs := n.blobRefs()
+	if refs == nil {
 		return n.Data, nil
 	}
-	data, err := s.blobs.Get(ctx, s.blobKey(n.Hash))
-	if err != nil {
-		return nil, fmt.Errorf("vfs: read blob %s: %w", n.Hash, err)
-	}
-	if hashContent(data) != n.Hash {
-		return nil, fmt.Errorf("vfs: blob %s does not match its hash", n.Hash)
-	}
-	return data, nil
-}
-
-// newFileInode builds the entry for data, uploading it as a blob if it is
-// large enough.
-func (s *Store) newFileInode(ctx context.Context, data []byte, perm fs.FileMode) (*inode, error) {
-	n := &inode{
-		Mode:    perm & fs.ModePerm,
-		Size:    int64(len(data)),
-		ModTime: s.now().UnixNano(),
-		Hash:    hashContent(data),
-	}
-	if len(data) >= s.inline {
-		if err := s.putBlob(ctx, n.Hash, data); err != nil {
+	out := make([]byte, 0, n.Size)
+	for _, c := range refs {
+		data, err := s.getChunk(ctx, c)
+		if err != nil {
 			return nil, err
 		}
-		n.Blob = true
-	} else if len(data) > 0 {
-		n.Data = slices.Clone(data)
+		out = append(out, data...)
 	}
-	return n, nil
+	return out, nil
+}
+
+// newFileInode builds the entry for data, uploading it as chunks if it is
+// large enough.
+func (s *Store) newFileInode(ctx context.Context, data []byte, perm fs.FileMode) (*inode, error) {
+	c := s.newChunker(ctx)
+	if err := c.write(data); err != nil {
+		return nil, err
+	}
+	return c.finish(perm)
+}
+
+// appendInode returns the entry for n's contents followed by data, with a new
+// modification time. n is nil if the file does not exist. Callers need not
+// hold s.mu: blobs are uploaded before the entry is committed.
+func (s *Store) appendInode(ctx context.Context, n *inode, data []byte) (*inode, error) {
+	switch {
+	case n == nil:
+		return s.newFileInode(ctx, data, 0o644)
+	case len(n.Chunks) == 0:
+		// Inline, or a legacy single blob: rewrite from the full contents.
+		old, err := s.contents(ctx, n)
+		if err != nil {
+			return nil, err
+		}
+		return s.newFileInode(ctx, append(slices.Clone(old), data...), n.Mode)
+	}
+	// Chunked: only the last chunk is read, then rewritten with data.
+	last := n.Chunks[len(n.Chunks)-1]
+	tail, err := s.getChunk(ctx, last)
+	if err != nil {
+		return nil, err
+	}
+	c, err := s.resumeChunker(ctx, n)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.write(tail); err != nil {
+		return nil, err
+	}
+	if err := c.write(data); err != nil {
+		return nil, err
+	}
+	return c.finish(n.Mode)
 }
 
 // ---------- Namespaces ----------
@@ -647,17 +700,26 @@ func (s *Store) CopyTo(ctx context.Context, src string, dst *Store, dstName stri
 		if err != nil {
 			return err
 		}
-		if !n.Blob || copied[n.Hash] {
-			continue
+		for _, ref := range n.blobRefs() {
+			if copied[ref.Hash] {
+				continue
+			}
+			copied[ref.Hash] = true
+			// Restart the grace period first, then skip chunks dst has.
+			dst.holdBlob(ref.Hash)
+			if ok, err := dst.blobs.Exists(ctx, dst.blobKey(ref.Hash)); err != nil {
+				return fmt.Errorf("vfs: check blob %s: %w", ref.Hash, err)
+			} else if ok {
+				continue
+			}
+			data, err := s.getBlob(ctx, ref.Hash)
+			if err != nil {
+				return err
+			}
+			if err := dst.putBlob(ctx, ref.Hash, data); err != nil {
+				return err
+			}
 		}
-		data, err := s.contents(ctx, n)
-		if err != nil {
-			return err
-		}
-		if err := dst.putBlob(ctx, n.Hash, data); err != nil {
-			return err
-		}
-		copied[n.Hash] = true
 	}
 
 	dst.mu.Lock()

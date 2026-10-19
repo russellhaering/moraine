@@ -42,7 +42,10 @@ type env struct {
 	clock *clock
 }
 
-const testInline = 16
+const (
+	testInline = 16
+	testChunk  = 256
+)
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
@@ -60,7 +63,7 @@ func (e *env) open(t *testing.T) {
 		t.Fatalf("moraine.Open: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	s, err := Open(db, Options{Blobs: e.store, BlobPrefix: "blobs", InlineThreshold: testInline, Now: e.clock.Now})
+	s, err := Open(db, Options{Blobs: e.store, BlobPrefix: "blobs", InlineThreshold: testInline, ChunkSize: testChunk, Now: e.clock.Now})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

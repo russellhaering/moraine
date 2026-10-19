@@ -27,8 +27,8 @@ func (fi fileInfo) ModTime() time.Time { return time.Unix(0, fi.n.ModTime) }
 func (fi fileInfo) IsDir() bool        { return fi.n.isDir() }
 func (fi fileInfo) Sys() any           { return nil }
 
-// File is an open file or directory. Blob-backed files are read with ranged
-// requests, so ReadAt and Seek do not fetch the whole blob.
+// File is an open file or directory. Large files are read with ranged
+// requests, so ReadAt and Seek fetch only the bytes needed.
 type File struct {
 	fsys *FS
 	ctx  context.Context
@@ -76,21 +76,45 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 		return 0, io.EOF
 	}
 	want := min(int64(len(p)), f.n.Size-off)
-	var n int
-	if f.n.Blob {
-		data, err := f.fsys.s.blobs.GetRange(f.ctx, f.fsys.s.blobKey(f.n.Hash), off, want)
-		if err != nil {
-			return 0, &fs.PathError{Op: "read", Path: f.path, Err: fmt.Errorf("vfs: read blob %s: %w", f.n.Hash, err)}
-		}
-		n = copy(p, data)
-		if int64(n) < want {
-			return n, &fs.PathError{Op: "read", Path: f.path, Err: io.ErrUnexpectedEOF}
-		}
-	} else {
-		n = copy(p, f.n.Data[off:off+want])
+	n, err := f.read(p[:want], off)
+	if err != nil {
+		return n, err
 	}
 	if int64(n) < int64(len(p)) {
 		return n, io.EOF
+	}
+	return n, nil
+}
+
+// read fills p from the file's contents at off, which is within the file.
+// Chunked and legacy blob files are read with ranged requests on only the
+// chunks p overlaps.
+func (f *File) read(p []byte, off int64) (int, error) {
+	refs := f.n.blobRefs()
+	if refs == nil {
+		return copy(p, f.n.Data[off:off+int64(len(p))]), nil
+	}
+	s := f.fsys.s
+	var n int
+	var start int64 // offset of the current chunk
+	for _, c := range refs {
+		end := start + c.Size
+		if off+int64(n) < end && n < len(p) {
+			rel := off + int64(n) - start
+			length := min(c.Size-rel, int64(len(p)-n))
+			data, err := s.blobs.GetRange(f.ctx, s.blobKey(c.Hash), rel, length)
+			if err != nil {
+				return n, &fs.PathError{Op: "read", Path: f.path, Err: fmt.Errorf("vfs: read blob %s: %w", c.Hash, err)}
+			}
+			n += copy(p[n:], data)
+			if int64(len(data)) < length {
+				return n, &fs.PathError{Op: "read", Path: f.path, Err: io.ErrUnexpectedEOF}
+			}
+		}
+		start = end
+	}
+	if n < len(p) {
+		return n, &fs.PathError{Op: "read", Path: f.path, Err: io.ErrUnexpectedEOF}
 	}
 	return n, nil
 }
