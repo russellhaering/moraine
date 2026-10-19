@@ -127,11 +127,9 @@ func TestCompactionRewritesOnlyOverlappingSSTables(t *testing.T) {
 			kept++
 		}
 	}
-	var deleted []string
 	for _, sst := range before {
 		if !afterPaths[sst.Path] {
 			replaced++
-			deleted = append(deleted, sst.Path)
 			if !overlapsRange(sst, "key-00100", "key-00109") {
 				t.Fatalf("rewrote non-overlapping sstable %+v", sst)
 			}
@@ -143,7 +141,6 @@ func TestCompactionRewritesOnlyOverlappingSSTables(t *testing.T) {
 		t.Fatalf("expected only a few sstables replaced: kept=%d replaced=%d of %d", kept, replaced, len(before))
 	}
 
-	_ = deleted
 }
 
 func TestCompactionGCOnlyReplacedSSTables(t *testing.T) {
