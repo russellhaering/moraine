@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +19,10 @@ type Compactor struct {
 	prefix    string
 	manifest  *ManifestStore
 	threshold int // L0 count that triggers compaction
-	epoch     uint64
+	// epoch, when nonzero, is the writer epoch this compactor works for. It
+	// stops compacting once a newer writer owns the database, so a process
+	// that has been taken over cannot commit a manifest over the new owner's.
+	epoch uint64
 
 	// onCommit, if set, is called with each manifest the compactor saves,
 	// before replaced SSTables are deleted.
@@ -31,6 +36,10 @@ type Compactor struct {
 
 	gcMu    sync.Mutex
 	pending []pendingDelete
+	// orphansQueued records that this compactor has scanned object storage
+	// for SSTables no manifest references (left by crashes, failed flushes or
+	// a previous owner's lost delete queue).
+	orphansQueued bool
 }
 
 type pendingDelete struct {
@@ -70,8 +79,9 @@ func (c *Compactor) scheduleDelete(paths []string) {
 	}
 }
 
-// sweep deletes queued SSTables whose grace period has elapsed. Failed
-// deletes stay queued and are retried on the next sweep.
+// sweep deletes queued SSTables whose grace period has elapsed, skipping any
+// the latest manifest references. Failed deletes stay queued and are retried
+// on the next sweep.
 func (c *Compactor) sweep(ctx context.Context) {
 	c.gcMu.Lock()
 	now := c.now()
@@ -85,19 +95,123 @@ func (c *Compactor) sweep(ctx context.Context) {
 	}
 	c.pending = keep
 	c.gcMu.Unlock()
+	if len(due) == 0 {
+		return
+	}
+
+	m, err := c.manifest.LoadLatest(ctx)
+	if err != nil {
+		slog.Warn("compactor: load manifest for gc", "err", err)
+		c.requeue(due)
+		return
+	}
+	live := referencedPaths(m)
 
 	var failed []pendingDelete
 	for _, p := range due {
+		if _, ok := live[p.path]; ok {
+			continue
+		}
 		if err := c.store.Delete(ctx, p.path); err != nil && !errors.Is(err, objstore.ErrNotFound) {
 			slog.Warn("compactor: delete replaced sstable", "path", p.path, "err", err)
 			failed = append(failed, p)
 		}
 	}
-	if len(failed) > 0 {
-		c.gcMu.Lock()
-		c.pending = append(c.pending, failed...)
-		c.gcMu.Unlock()
+	c.requeue(failed)
+}
+
+func (c *Compactor) requeue(ps []pendingDelete) {
+	if len(ps) == 0 {
+		return
 	}
+	c.gcMu.Lock()
+	c.pending = append(c.pending, ps...)
+	c.gcMu.Unlock()
+}
+
+// referencedPaths returns the object paths of every SSTable m references.
+func referencedPaths(m *Manifest) map[string]struct{} {
+	live := map[string]struct{}{}
+	if m == nil {
+		return live
+	}
+	for _, sst := range m.L0 {
+		live[sst.Path] = struct{}{}
+	}
+	for _, run := range m.SortedRuns {
+		for _, sst := range run.SSTables {
+			live[sst.Path] = struct{}{}
+		}
+	}
+	return live
+}
+
+// queueOrphans lists the WAL and sorted-run SSTables under the prefix and
+// queues for deletion those the latest manifest does not reference. Objects
+// that may belong to a write still in flight (WAL IDs at or past WALIDNext in
+// the current epoch, sorted runs newer than the manifest) and objects whose
+// names it does not recognize are left alone. Deletion still waits out the
+// grace period, so a reader holding an older manifest can finish.
+func (c *Compactor) queueOrphans(ctx context.Context, m *Manifest) error {
+	live := referencedPaths(m)
+	var orphans []string
+	for _, dir := range []string{"/wal/", "/sorted/"} {
+		keys, err := c.store.List(ctx, c.prefix+dir)
+		if err != nil {
+			return fmt.Errorf("compactor: list %s: %w", dir, err)
+		}
+		for _, k := range keys {
+			if _, ok := live[k]; ok {
+				continue
+			}
+			if c.mayBeInFlight(k, m) {
+				continue
+			}
+			orphans = append(orphans, k)
+		}
+	}
+	if len(orphans) > 0 {
+		slog.Info("compactor: queued unreferenced sstables for deletion", "count", len(orphans))
+	}
+	c.scheduleDelete(orphans)
+	return nil
+}
+
+// mayBeInFlight reports whether key could be an SSTable a writer or
+// compactor has written but not yet recorded in a manifest, or is not an
+// SSTable name this package produces.
+func (c *Compactor) mayBeInFlight(key string, m *Manifest) bool {
+	if rest, ok := strings.CutPrefix(key, c.prefix+"/wal/"); ok {
+		rest, ok = strings.CutSuffix(rest, ".sst")
+		if !ok {
+			return true
+		}
+		epoch, idStr := uint64(0), rest
+		if e, id, found := strings.Cut(rest, "/"); found {
+			n, err := strconv.ParseUint(e, 10, 64)
+			if err != nil {
+				return true
+			}
+			epoch, idStr = n, id
+		}
+		id, err := strconv.ParseUint(idStr, 10, 64)
+		if err != nil {
+			return true
+		}
+		return epoch > m.WriterEpoch || (epoch == m.WriterEpoch && id >= m.WALIDNext)
+	}
+	if rest, ok := strings.CutPrefix(key, c.prefix+"/sorted/sorted-L1-"); ok {
+		rest, ok = strings.CutSuffix(rest, ".sst")
+		if !ok {
+			return true
+		}
+		version, err := strconv.ParseUint(rest, 10, 64)
+		if err != nil {
+			return true
+		}
+		return version > m.Version
+	}
+	return true
 }
 
 // MaybeCompact checks if compaction is needed and performs it.
@@ -107,6 +221,23 @@ func (c *Compactor) MaybeCompact(ctx context.Context) error {
 	m, err := c.manifest.LoadLatest(ctx)
 	if err != nil || m == nil {
 		return err
+	}
+
+	if c.epoch != 0 && m.WriterEpoch != c.epoch {
+		return fmt.Errorf("compactor: epoch %d superseded by epoch %d: %w", c.epoch, m.WriterEpoch, ErrStaleWriter)
+	}
+
+	c.gcMu.Lock()
+	scanOrphans := !c.orphansQueued
+	c.orphansQueued = true
+	c.gcMu.Unlock()
+	if scanOrphans {
+		if err := c.queueOrphans(ctx, m); err != nil {
+			slog.Warn("compactor: scan for unreferenced sstables", "err", err)
+			c.gcMu.Lock()
+			c.orphansQueued = false
+			c.gcMu.Unlock()
+		}
 	}
 
 	if len(m.L0) < c.threshold {
@@ -126,7 +257,7 @@ func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
 		if err != nil {
 			return fmt.Errorf("compactor: read %s: %w", sst.Path, err)
 		}
-		reader, err := NewSSTableReaderLegacy(sst.ID, data)
+		reader, err := NewSSTableReaderFromBytes(sst.ID, data)
 		if err != nil {
 			return fmt.Errorf("compactor: parse %s: %w", sst.ID, err)
 		}
@@ -146,7 +277,7 @@ func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
 			if err != nil {
 				return fmt.Errorf("compactor: read sorted run %s: %w", sst.Path, err)
 			}
-			reader, err := NewSSTableReaderLegacy(sst.ID, data)
+			reader, err := NewSSTableReaderFromBytes(sst.ID, data)
 			if err != nil {
 				return fmt.Errorf("compactor: parse sorted run %s: %w", sst.ID, err)
 			}
@@ -209,6 +340,9 @@ func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
 			if err != nil || base == nil {
 				return fmt.Errorf("compactor: reload manifest: %w", err)
 			}
+		}
+		if c.epoch != 0 && base.WriterEpoch != c.epoch {
+			return fmt.Errorf("compactor: epoch %d superseded by epoch %d: %w", c.epoch, base.WriterEpoch, ErrStaleWriter)
 		}
 
 		// Remove only the L0 SSTables we actually compacted; keep any

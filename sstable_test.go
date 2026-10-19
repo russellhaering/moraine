@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"testing"
-
 )
 
 func TestWriteReadRoundTrip(t *testing.T) {
@@ -34,7 +33,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Fatalf("expected Size=%d, got %d", len(data), meta.Size)
 	}
 
-	r, err := NewSSTableReaderLegacy("test-1", data)
+	r, err := NewSSTableReaderFromBytes("test-1", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -94,7 +93,7 @@ func TestMultipleDataBlocks(t *testing.T) {
 		t.Fatalf("expected %d entries, got %d", numEntries, meta.EntryCount)
 	}
 
-	r, err := NewSSTableReaderLegacy("test-multi", data)
+	r, err := NewSSTableReaderFromBytes("test-multi", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -134,7 +133,7 @@ func TestGetBinarySearch(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := NewSSTableReaderLegacy("test-bsearch", data)
+	r, err := NewSSTableReaderFromBytes("test-bsearch", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -187,7 +186,7 @@ func TestBloomFilter(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := NewSSTableReaderLegacy("test-bloom", data)
+	r, err := NewSSTableReaderFromBytes("test-bloom", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -231,7 +230,7 @@ func TestSSTableIteratorOrdering(t *testing.T) {
 		t.Fatalf("Finish: %v", err)
 	}
 
-	r, err := NewSSTableReaderLegacy("test-iter", data)
+	r, err := NewSSTableReaderFromBytes("test-iter", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -268,7 +267,7 @@ func TestEmptySSTable(t *testing.T) {
 		t.Fatalf("expected empty key range, got [%s, %s]", meta.MinKey, meta.MaxKey)
 	}
 
-	r, err := NewSSTableReaderLegacy("test-empty", data)
+	r, err := NewSSTableReaderFromBytes("test-empty", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -314,7 +313,7 @@ func TestDuplicateKeysHighestSeqNum(t *testing.T) {
 		t.Fatalf("expected 3 entries, got %d", meta.EntryCount)
 	}
 
-	r, err := NewSSTableReaderLegacy("test-dup", data)
+	r, err := NewSSTableReaderFromBytes("test-dup", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -347,7 +346,7 @@ func TestFooterMagicValidation(t *testing.T) {
 	corrupted[len(corrupted)-8] = 0xFF
 	corrupted[len(corrupted)-7] = 0xFF
 
-	_, err = NewSSTableReaderLegacy("test-magic", corrupted)
+	_, err = NewSSTableReaderFromBytes("test-magic", corrupted)
 	if err == nil {
 		t.Fatal("expected error for corrupted magic, got nil")
 	}
@@ -359,7 +358,7 @@ func TestSSTableIteratorFromEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReaderLegacy("test-from-empty", data)
+	r, err := NewSSTableReaderFromBytes("test-from-empty", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -380,7 +379,7 @@ func TestSSTableIteratorFromBeginning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReaderLegacy("test-from-begin", data)
+	r, err := NewSSTableReaderFromBytes("test-from-begin", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -410,7 +409,7 @@ func TestSSTableIteratorFromMiddle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReaderLegacy("test-from-mid", data)
+	r, err := NewSSTableReaderFromBytes("test-from-mid", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -445,7 +444,7 @@ func TestSSTableIteratorFromPastEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReaderLegacy("test-from-past", data)
+	r, err := NewSSTableReaderFromBytes("test-from-past", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -466,7 +465,7 @@ func TestSSTableIteratorFromExactKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	r, err := NewSSTableReaderLegacy("test-from-exact", data)
+	r, err := NewSSTableReaderFromBytes("test-from-exact", data)
 	if err != nil {
 		t.Fatalf("NewSSTableReader: %v", err)
 	}
@@ -490,7 +489,7 @@ func TestSSTableIteratorFromExactKey(t *testing.T) {
 }
 
 func TestDataTooShortForFooter(t *testing.T) {
-	_, err := NewSSTableReaderLegacy("bad", make([]byte, 10))
+	_, err := NewSSTableReaderFromBytes("bad", make([]byte, 10))
 	if err == nil {
 		t.Fatal("expected error for data shorter than footer")
 	}

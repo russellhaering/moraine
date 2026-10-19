@@ -37,6 +37,13 @@ type DBConfig struct {
 	BlockCacheSize  int64 // bytes for in-memory block cache
 	DiskCacheDir    string
 	DiskCacheSize   int64
+	// BlockCache and DiskCache, when set, are used instead of creating
+	// per-database caches from the size and directory settings above, so
+	// many databases in one process can share a memory and disk budget.
+	// Cache keys are object paths, so databases sharing a cache must use
+	// distinct prefixes.
+	BlockCache      *cache.LRUBlockCache
+	DiskCache       *cache.DiskCache
 	L0CompactThresh int
 	CompactInterval time.Duration
 }
@@ -52,14 +59,17 @@ func Open(ctx context.Context, cfg DBConfig) (*DB, error) {
 		return nil, fmt.Errorf("lsm: open writer: %w", err)
 	}
 
-	blockCacheSize := cfg.BlockCacheSize
-	if blockCacheSize <= 0 {
-		blockCacheSize = 256 << 20 // 256MB
+	blockCache := cfg.BlockCache
+	if blockCache == nil {
+		blockCacheSize := cfg.BlockCacheSize
+		if blockCacheSize <= 0 {
+			blockCacheSize = 256 << 20 // 256MB
+		}
+		blockCache = cache.NewLRUBlockCache(blockCacheSize)
 	}
-	blockCache := cache.NewLRUBlockCache(blockCacheSize)
 
-	var diskCache *cache.DiskCache
-	if cfg.DiskCacheDir != "" {
+	diskCache := cfg.DiskCache
+	if diskCache == nil && cfg.DiskCacheDir != "" {
 		diskCacheSize := cfg.DiskCacheSize
 		if diskCacheSize <= 0 {
 			diskCacheSize = 1 << 30 // 1GB
@@ -80,6 +90,7 @@ func Open(ctx context.Context, cfg DBConfig) (*DB, error) {
 	}
 	compactor := NewCompactor(cfg.Store, cfg.Prefix, compactThresh)
 	compactor.onCommit = writer.adoptManifest
+	compactor.epoch = writer.epoch
 
 	compactInterval := cfg.CompactInterval
 	if compactInterval <= 0 {

@@ -82,8 +82,7 @@ func (m *MemoryStore) GetRange(_ context.Context, key string, offset, length int
 	cp := make([]byte, end-offset)
 	copy(cp, data[offset:end])
 	return cp, nil
-	}
-
+}
 
 func (m *MemoryStore) Head(_ context.Context, key string) (*ObjectMeta, error) {
 	m.mu.RLock()

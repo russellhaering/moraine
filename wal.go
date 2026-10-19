@@ -80,5 +80,5 @@ func ReadWAL(ctx context.Context, store objstore.ObjectStore, prefix string, id 
 	if err != nil {
 		return nil, fmt.Errorf("wal: read %s: %w", key, err)
 	}
-	return NewSSTableReaderLegacy(fmt.Sprintf("wal-%020d", id), data)
+	return NewSSTableReaderFromBytes(fmt.Sprintf("wal-%020d", id), data)
 }

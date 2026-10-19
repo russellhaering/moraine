@@ -207,19 +207,38 @@ func (m *MemTable) IteratorFrom(afterKey string) *MemTableIterator {
 	if afterKey == "" {
 		return m.Iterator()
 	}
+	return m.seek(afterKey, false)
+}
 
+// SeekFrom returns an iterator positioned before the first entry with
+// key >= key.
+func (m *MemTable) SeekFrom(key string) *MemTableIterator {
+	if key == "" {
+		return m.Iterator()
+	}
+	return m.seek(key, true)
+}
+
+func (m *MemTable) seek(key string, inclusive bool) *MemTableIterator {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Use skip-list levels to seek to the first node with key > afterKey.
+	// Use skip-list levels to advance past every node that sorts before the
+	// target: keys < key when inclusive, keys <= key otherwise.
+	before := func(k string) bool {
+		if inclusive {
+			return k < key
+		}
+		return k <= key
+	}
 	curr := m.head
 	for level := m.height - 1; level >= 0; level-- {
-		for curr.next[level] != nil && curr.next[level].entry.Key <= afterKey {
+		for curr.next[level] != nil && before(curr.next[level].entry.Key) {
 			curr = curr.next[level]
 		}
 	}
 
-	// curr.next[0] is now the first node with key > afterKey (or nil).
+	// curr.next[0] is now the first node at or past the target (or nil).
 	var entries []Entry
 	nd := curr.next[0]
 	for nd != nil {

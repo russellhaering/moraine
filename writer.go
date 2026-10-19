@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 
 	"github.com/russellhaering/moraine/objstore"
@@ -156,10 +157,26 @@ func (w *Writer) Flush(ctx context.Context) error {
 }
 
 func (w *Writer) flushLocked(ctx context.Context) error {
-	if w.active.Len() == 0 {
-		return nil
+	if w.active.Len() > 0 {
+		w.frozen = append([]*MemTable{w.active.Freeze()}, w.frozen...)
+		w.active = NewMemTable()
 	}
 
+	// Flush oldest first so L0 stays newest-first. A table left behind by an
+	// earlier failed flush is retried here before anything newer, and stays
+	// readable from w.frozen until it is durable.
+	for len(w.frozen) > 0 {
+		if err := w.flushTable(ctx, w.frozen[len(w.frozen)-1]); err != nil {
+			return err
+		}
+		w.frozen = w.frozen[:len(w.frozen)-1]
+	}
+	return nil
+}
+
+// checkEpochLocked reloads the latest manifest, adopting it if this writer
+// still owns the database.
+func (w *Writer) checkEpochLocked(ctx context.Context) error {
 	latest, err := w.manifest.LoadLatest(ctx)
 	if err != nil {
 		return fmt.Errorf("writer: reload manifest: %w", err)
@@ -170,12 +187,24 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 		}
 		w.currentManifest = latest
 	}
+	return nil
+}
 
-	frozen := w.active.Freeze()
-	w.frozen = append([]*MemTable{frozen}, w.frozen...)
-	w.active = NewMemTable()
+// flushTable writes one frozen MemTable to the WAL and records it in the
+// manifest as the newest L0 SSTable.
+func (w *Writer) flushTable(ctx context.Context, frozen *MemTable) error {
+	if err := w.checkEpochLocked(ctx); err != nil {
+		return err
+	}
 
 	walID, meta, err := w.wal.Write(ctx, frozen)
+	if errors.Is(err, objstore.ErrPreconditionFailed) {
+		// This writer still owns the epoch (checked above), so the ID can
+		// only be taken by an earlier attempt of ours whose result was lost.
+		// Nothing references that object; skip past it.
+		w.wal.nextID++
+		walID, meta, err = w.wal.Write(ctx, frozen)
+	}
 	if err != nil {
 		return fmt.Errorf("writer: flush wal: %w", err)
 	}
@@ -195,15 +224,12 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 	// A concurrent compactor may bump the version between our read and write.
 	const maxRetries = 5
 	for attempt := range maxRetries {
-		latest, err := w.manifest.LoadLatest(ctx)
-		if err != nil {
-			return fmt.Errorf("writer: reload manifest: %w", err)
+		if err := w.checkEpochLocked(ctx); err != nil {
+			return err
 		}
-		if latest != nil {
-			if latest.WriterEpoch != w.epoch {
-				return fmt.Errorf("writer: epoch %d superseded by epoch %d: %w", w.epoch, latest.WriterEpoch, ErrStaleWriter)
-			}
-			w.currentManifest = latest
+		// A save that reported failure may still have landed.
+		if slices.ContainsFunc(w.currentManifest.L0, func(s SSTInfo) bool { return s.Path == sstInfo.Path }) {
+			break
 		}
 
 		lastSeqNum := w.currentManifest.LastSeqNum
@@ -231,12 +257,8 @@ func (w *Writer) flushLocked(ctx context.Context) error {
 		w.currentManifest = newManifest
 		slog.Info("writer flushed", "wal_id", walID, "entries", meta.EntryCount,
 			"manifest_version", newManifest.Version)
-		// The frozen table we just flushed is now durable in the manifest;
-		// drop it to bound memory growth.
-		w.frozen = w.frozen[1:]
 		break
 	}
-
 	return nil
 }
 
