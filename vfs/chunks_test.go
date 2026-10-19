@@ -416,3 +416,102 @@ func TestChunkGarbageCollection(t *testing.T) {
 		t.Fatalf("live file damaged: %v", err)
 	}
 }
+
+// slowDeleteStore delays every Delete and reports when one starts.
+type slowDeleteStore struct {
+	objstore.ObjectStore
+	delay   time.Duration
+	started chan struct{}
+	deletes atomic.Int64
+}
+
+func (s *slowDeleteStore) Delete(ctx context.Context, key string) error {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	time.Sleep(s.delay)
+	err := s.ObjectStore.Delete(ctx, key)
+	s.deletes.Add(1)
+	return err
+}
+
+// TestGarbageCollectionDoesNotBlockWrites checks that writes proceed while
+// GC is in its deletion phase, instead of waiting for all deletes.
+func TestGarbageCollectionDoesNotBlockWrites(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	f := e.fs(t, "main")
+	const orphans = 10
+	for i := range orphans {
+		must(t, e.s.putBlob(ctx, hashContent(pattern(100+i)), pattern(100+i)))
+	}
+	if _, err := e.s.CollectGarbage(ctx); err != nil { // first sighting
+		t.Fatal(err)
+	}
+	e.clock.Advance(DefaultGCGrace + time.Second)
+
+	slow := &slowDeleteStore{ObjectStore: e.store, delay: 50 * time.Millisecond, started: make(chan struct{}, 1)}
+	e.s.blobs = slow
+	done := make(chan GCStats)
+	go func() {
+		st, err := e.s.CollectGarbage(ctx)
+		if err != nil {
+			t.Error(err)
+		}
+		done <- st
+	}()
+	<-slow.started // deletion phase is under way
+
+	deletedAtWrite := make(chan int64, 2)
+	for i, data := range [][]byte{[]byte("inline"), pattern(testChunk + 5)} {
+		must(t, f.WriteFile(ctx, fmt.Sprintf("w%d", i), data, 0o644))
+		deletedAtWrite <- slow.deletes.Load()
+	}
+	// Both writes, including one that uploads blobs, finished before the
+	// deletion phase did.
+	if got := <-deletedAtWrite; got >= orphans {
+		t.Fatalf("inline write waited for %d deletes", got)
+	}
+	if got := <-deletedAtWrite; got >= orphans {
+		t.Fatalf("blob write waited for %d deletes", got)
+	}
+	if st := <-done; st.Deleted != orphans {
+		t.Fatalf("gc: %+v", st)
+	}
+	if got, err := f.ReadFile(ctx, "w1"); err != nil || !bytes.Equal(got, pattern(testChunk+5)) {
+		t.Fatalf("write during gc damaged: %v", err)
+	}
+}
+
+// TestGarbageCollectionSkipsBlobReusedAfterMark covers a write that reuses a
+// candidate between the mark and its deletion.
+func TestGarbageCollectionSkipsBlobReusedAfterMark(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	f := e.fs(t, "main")
+	data := pattern(100)
+	must(t, e.s.putBlob(ctx, hashContent(data), data))
+	if _, err := e.s.CollectGarbage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(DefaultGCGrace + time.Second)
+
+	var stats GCStats
+	keys, err := e.store.List(ctx, "blobs/")
+	must(t, err)
+	candidates, err := e.s.markGarbage(ctx, keys, &stats)
+	must(t, err)
+	if len(candidates) != 1 {
+		t.Fatalf("%d candidates, want 1", len(candidates))
+	}
+	// A write reuses the blob and commits after the mark.
+	must(t, f.WriteFile(ctx, "reuse", data, 0o644))
+	e.s.sweepBlob(ctx, candidates[0], &stats)
+	if stats.Deleted != 0 {
+		t.Fatal("swept a blob a write reused after the mark")
+	}
+	if got, err := f.ReadFile(ctx, "reuse"); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("ReadFile: %v", err)
+	}
+}
