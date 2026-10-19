@@ -142,7 +142,7 @@ if err != nil {
 _ = docs
 ```
 
-The vfs layer stores file metadata, and files smaller than `InlineThreshold`, in the database; larger contents are stored once per distinct content under `BlobPrefix`. A namespace is a complete file tree, and forking one copies only metadata, so namespaces serve as checkpoints, isolated working copies, and forks. `Diff` and `Apply` merge changes between namespaces. Changes are durable once the database is flushed.
+The vfs layer stores file metadata, and files smaller than `InlineThreshold`, in the database; larger contents are stored once per distinct content under `BlobPrefix`. A namespace is a complete file tree, and forking one copies only metadata, so namespaces serve as checkpoints, isolated working copies, and forks. `Diff` and `Apply` merge changes between namespaces; `ApplyIfUnchanged` does so only if the target has not changed the same paths since the fork, checked under the same lock as the apply. Changes are durable once the database is flushed.
 
 ```go
 store, err := vfs.Open(db, vfs.Options{Blobs: objectStore, BlobPrefix: "agents/a1/blobs"})
@@ -167,6 +167,11 @@ for i, c := range changes {
 	paths[i] = c.Path
 }
 _ = store.Apply(ctx, "worker", "main", paths)
+
+// To merge only if main has not touched those paths since the fork, fork a
+// base too and use the race-free guarded form instead of Diff then Apply:
+//
+//	conflicts, err := store.ApplyIfUnchanged(ctx, "worker", "main", "worker-base", paths)
 
 // main.IOFS(ctx) is an fs.FS, so fs.WalkDir and fs.Glob work on it.
 // Run store.CollectGarbage periodically to delete unreferenced blobs.

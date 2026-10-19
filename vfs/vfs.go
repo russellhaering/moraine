@@ -472,6 +472,12 @@ func (s *Store) Diff(ctx context.Context, base, other string) ([]Change, error) 
 	if err := validNamespace(other); err != nil {
 		return nil, err
 	}
+	return s.diff(ctx, base, other)
+}
+
+// diff is Diff for validated namespace names. It takes no lock; callers that
+// must not race with writers hold s.mu.
+func (s *Store) diff(ctx context.Context, base, other string) ([]Change, error) {
 	a, err := s.tree(ctx, base)
 	if err != nil {
 		return nil, err
@@ -511,6 +517,59 @@ func (s *Store) Apply(ctx context.Context, from, to string, paths []string) erro
 	if err := validNamespace(to); err != nil {
 		return err
 	}
+	if err := validateApplyPaths(paths); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyLocked(ctx, from, to, paths)
+}
+
+// ApplyIfUnchanged is Apply guarded by a conflict check made under the same
+// lock: it applies paths from `from` to `to` only if no path in paths
+// overlaps (is the same as, inside, or contains) a path where `to` differs
+// from `base`. On conflict it applies nothing and returns the conflicting
+// paths from `paths`.
+//
+// Use it to merge a fork back when `base` is the snapshot the fork was made
+// from: unlike a separate Diff(base, to) followed by Apply, a write to `to`
+// between the check and the apply cannot go undetected.
+func (s *Store) ApplyIfUnchanged(ctx context.Context, from, to, base string, paths []string) (conflicts []string, err error) {
+	for _, ns := range []string{from, to, base} {
+		if err := validNamespace(ns); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateApplyPaths(paths); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed, err := s.diff(ctx, base, to)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range paths {
+		for _, c := range changed {
+			if pathsOverlap(p, c.Path) {
+				conflicts = append(conflicts, p)
+				break
+			}
+		}
+	}
+	if len(conflicts) > 0 {
+		return conflicts, nil
+	}
+	return nil, s.applyLocked(ctx, from, to, paths)
+}
+
+// pathsOverlap reports whether p and q are the same path or one contains
+// the other.
+func pathsOverlap(p, q string) bool {
+	return p == q || strings.HasPrefix(q, p+"/") || strings.HasPrefix(p, q+"/")
+}
+
+func validateApplyPaths(paths []string) error {
 	for _, p := range paths {
 		if _, err := cleanPath("apply", p); err != nil {
 			return err
@@ -519,9 +578,11 @@ func (s *Store) Apply(ctx context.Context, from, to string, paths []string) erro
 			return &fs.PathError{Op: "apply", Path: p, Err: fs.ErrInvalid}
 		}
 	}
+	return nil
+}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// applyLocked is Apply for validated arguments. Callers hold s.mu.
+func (s *Store) applyLocked(ctx context.Context, from, to string, paths []string) error {
 	result, err := s.tree(ctx, to)
 	if err != nil {
 		return err

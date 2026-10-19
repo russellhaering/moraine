@@ -376,6 +376,147 @@ func TestDiffAndApply(t *testing.T) {
 	}
 }
 
+// guardedEnv forks main into base and job, with src/a, src/b and other in
+// main, for the ApplyIfUnchanged tests.
+func guardedEnv(t *testing.T) *env {
+	t.Helper()
+	ctx := context.Background()
+	e := newEnv(t)
+	main := e.fs(t, "main")
+	must(t, main.MkdirAll(ctx, "src", 0o755))
+	must(t, main.WriteFile(ctx, "src/a", []byte("a"), 0o644))
+	must(t, main.WriteFile(ctx, "src/b", []byte("b"), 0o644))
+	must(t, main.WriteFile(ctx, "other", []byte("o"), 0o644))
+	must(t, e.s.Fork(ctx, "main", "base"))
+	must(t, e.s.Fork(ctx, "main", "job"))
+	return e
+}
+
+func TestApplyIfUnchanged(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("clean", func(t *testing.T) {
+		e := guardedEnv(t)
+		must(t, e.fs(t, "job").WriteFile(ctx, "src/a", []byte("A"), 0o644))
+		must(t, e.fs(t, "main").WriteFile(ctx, "other", []byte("O"), 0o644)) // unrelated
+		conflicts, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{"src/a"})
+		if err != nil || len(conflicts) != 0 {
+			t.Fatalf("ApplyIfUnchanged: %v, %v", conflicts, err)
+		}
+		if got, _ := e.fs(t, "main").ReadFile(ctx, "src/a"); string(got) != "A" {
+			t.Fatalf("src/a = %q, want A", got)
+		}
+		if got, _ := e.fs(t, "main").ReadFile(ctx, "other"); string(got) != "O" {
+			t.Fatalf("unrelated change lost: %q", got)
+		}
+	})
+
+	t.Run("same path", func(t *testing.T) {
+		e := guardedEnv(t)
+		must(t, e.fs(t, "job").WriteFile(ctx, "src/a", []byte("job"), 0o644))
+		must(t, e.fs(t, "main").WriteFile(ctx, "src/a", []byte("parent"), 0o644))
+		conflicts, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{"src/a"})
+		if err != nil || fmt.Sprint(conflicts) != "[src/a]" {
+			t.Fatalf("ApplyIfUnchanged: %v, %v", conflicts, err)
+		}
+		// Nothing was applied.
+		if got, _ := e.fs(t, "main").ReadFile(ctx, "src/a"); string(got) != "parent" {
+			t.Fatalf("src/a = %q, want parent", got)
+		}
+	})
+
+	t.Run("rewrite with same content is not a change", func(t *testing.T) {
+		e := guardedEnv(t)
+		must(t, e.fs(t, "job").WriteFile(ctx, "src/a", []byte("A"), 0o644))
+		e.clock.Advance(time.Minute)
+		must(t, e.fs(t, "main").WriteFile(ctx, "src/a", []byte("a"), 0o644))
+		if conflicts, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{"src/a"}); err != nil || len(conflicts) != 0 {
+			t.Fatalf("ApplyIfUnchanged: %v, %v", conflicts, err)
+		}
+	})
+
+	t.Run("directory removed in target", func(t *testing.T) {
+		e := guardedEnv(t)
+		must(t, e.fs(t, "job").WriteFile(ctx, "src/a", []byte("A"), 0o644))
+		must(t, e.fs(t, "main").RemoveAll(ctx, "src"))
+		conflicts, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{"src/a", "other"})
+		if err != nil || fmt.Sprint(conflicts) != "[src/a]" {
+			t.Fatalf("ApplyIfUnchanged: %v, %v", conflicts, err)
+		}
+		if _, err := e.fs(t, "main").Stat(ctx, "src"); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("conflicting apply changed the target: %v", err)
+		}
+	})
+
+	t.Run("file added under applied directory", func(t *testing.T) {
+		e := guardedEnv(t)
+		must(t, e.fs(t, "job").MkdirAll(ctx, "src", 0o700)) // mode change on src
+		must(t, e.fs(t, "main").WriteFile(ctx, "src/new", []byte("n"), 0o644))
+		conflicts, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{"src"})
+		if err != nil || fmt.Sprint(conflicts) != "[src]" {
+			t.Fatalf("ApplyIfUnchanged: %v, %v", conflicts, err)
+		}
+	})
+
+	t.Run("applied file inside changed directory path", func(t *testing.T) {
+		e := guardedEnv(t)
+		must(t, e.fs(t, "job").WriteFile(ctx, "docs", []byte("file"), 0o644))
+		must(t, e.fs(t, "main").MkdirAll(ctx, "docs/sub", 0o755))
+		conflicts, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{"docs/sub/x"})
+		if err != nil || fmt.Sprint(conflicts) != "[docs/sub/x]" {
+			t.Fatalf("ApplyIfUnchanged: %v, %v", conflicts, err)
+		}
+	})
+
+	t.Run("still rejects orphans", func(t *testing.T) {
+		e := guardedEnv(t)
+		must(t, e.fs(t, "job").MkdirAll(ctx, "docs", 0o755))
+		must(t, e.fs(t, "job").WriteFile(ctx, "docs/x", []byte("x"), 0o644))
+		_, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{"docs/x"})
+		if !errors.Is(err, fs.ErrInvalid) {
+			t.Fatalf("orphaning apply: %v", err)
+		}
+		if _, err := e.fs(t, "main").Stat(ctx, "docs/x"); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatal("rejected apply changed the target")
+		}
+	})
+
+	t.Run("invalid arguments", func(t *testing.T) {
+		e := guardedEnv(t)
+		for _, ns := range [][3]string{{"..", "main", "base"}, {"job", "a/b", "base"}, {"job", "main", ""}} {
+			if _, err := e.s.ApplyIfUnchanged(ctx, ns[0], ns[1], ns[2], nil); err == nil {
+				t.Errorf("ApplyIfUnchanged%q succeeded", ns)
+			}
+		}
+		for _, p := range []string{".", "/abs", "a/../b"} {
+			if _, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{p}); !errors.Is(err, fs.ErrInvalid) {
+				t.Errorf("path %q: %v", p, err)
+			}
+		}
+	})
+
+	// The separate Diff check goes stale when the target changes after it;
+	// the guarded call checks under the lock and notices.
+	t.Run("write after separate diff", func(t *testing.T) {
+		e := guardedEnv(t)
+		must(t, e.fs(t, "job").WriteFile(ctx, "src/a", []byte("job"), 0o644))
+		parent, err := e.s.Diff(ctx, "base", "main")
+		must(t, err)
+		if len(parent) != 0 {
+			t.Fatalf("parent changed before the race: %v", parent)
+		}
+		must(t, e.fs(t, "main").WriteFile(ctx, "src/a", []byte("parent"), 0o644)) // lands after the check
+		conflicts, err := e.s.ApplyIfUnchanged(ctx, "job", "main", "base", []string{"src/a"})
+		if err != nil || fmt.Sprint(conflicts) != "[src/a]" {
+			t.Fatalf("ApplyIfUnchanged: %v, %v", conflicts, err)
+		}
+		// Plain Apply would have silently overwritten the parent's write.
+		if got, _ := e.fs(t, "main").ReadFile(ctx, "src/a"); string(got) != "parent" {
+			t.Fatalf("src/a = %q, want parent", got)
+		}
+	})
+}
+
 func TestCopyToAnotherDatabase(t *testing.T) {
 	ctx := context.Background()
 	src := newEnv(t)
