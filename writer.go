@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/russellhaering/moraine/objstore"
 )
@@ -203,6 +204,7 @@ func (w *Writer) checkEpochLocked(ctx context.Context) error {
 // flushTable writes one frozen MemTable to the WAL and records it in the
 // manifest as the newest L0 SSTable.
 func (w *Writer) flushTable(ctx context.Context, frozen *MemTable) error {
+	start := time.Now()
 	if err := w.checkEpochLocked(ctx); err != nil {
 		return err
 	}
@@ -266,7 +268,7 @@ func (w *Writer) flushTable(ctx context.Context, frozen *MemTable) error {
 
 		w.currentManifest = newManifest
 		slog.Info("writer flushed", "wal_id", walID, "entries", meta.EntryCount,
-			"manifest_version", newManifest.Version)
+			"manifest_version", newManifest.Version, "bytes", meta.Size, "duration", time.Since(start))
 		break
 	}
 	return nil
@@ -286,6 +288,17 @@ func (w *Writer) ActiveMemTable() *MemTable {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.active
+}
+
+// unflushedBytes is the size of the active and frozen MemTables.
+func (w *Writer) unflushedBytes() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := w.active.Size()
+	for _, mt := range w.frozen {
+		n += mt.Size()
+	}
+	return n
 }
 
 // CurrentManifest returns the current manifest state.

@@ -44,8 +44,12 @@ type DBConfig struct {
 	// many databases in one process can share a memory and disk budget.
 	// Cache keys are object paths, so databases sharing a cache must use
 	// distinct prefixes.
-	BlockCache      *cache.LRUBlockCache
-	DiskCache       *cache.DiskCache
+	BlockCache *cache.LRUBlockCache
+	DiskCache  *cache.DiskCache
+	// L0CompactThresh is the number of L0 SSTables (one per flush) that
+	// triggers a compaction. Zero means 4. Callers that flush often and
+	// write little per flush can raise it so each compaction absorbs more
+	// new data per rewrite of the sorted run.
 	L0CompactThresh int
 	// CompactInterval is how often a database without a CompactionPool
 	// checks whether to compact. It is unused with a pool.
@@ -238,11 +242,13 @@ func (db *DB) SizeBytes() int64 {
 			}
 		}
 	}
-	n += db.writer.ActiveMemTable().Size()
-	for _, mt := range db.writer.FrozenMemTables() {
-		n += mt.Size()
-	}
-	return n
+	return n + db.UnflushedBytes()
+}
+
+// UnflushedBytes is the size of the MemTables not yet flushed: the writes a
+// crash would lose. Callers that defer Flush can use it to bound that loss.
+func (db *DB) UnflushedBytes() int64 {
+	return db.writer.unflushedBytes()
 }
 
 // Close flushes any buffered writes to object storage and shuts down the

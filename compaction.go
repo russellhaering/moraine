@@ -448,6 +448,7 @@ func (m *compactionMerge) Next() bool {
 // are kept as they are, so a compaction rewrites only the part of the
 // database the L0 tables touch.
 func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
+	start := time.Now()
 	slog.Info("compaction starting", "l0_count", len(m.L0))
 
 	// Key range covered by L0. The run SSTables overlapping it form a
@@ -495,6 +496,7 @@ func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
 	target := c.targetSize()
 	var outputs []SSTInfo
 	var mergedEntries int
+	var bytesWritten int64
 	var writer *SSTableWriter
 	var written int64
 	finish := func() error {
@@ -521,6 +523,7 @@ func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
 			Size:   meta.Size,
 		})
 		mergedEntries += meta.EntryCount
+		bytesWritten += meta.Size
 		writer, written = nil, 0
 		return nil
 	}
@@ -608,7 +611,9 @@ func (c *Compactor) compact(ctx context.Context, m *Manifest) error {
 			"output_sstables", len(outputs),
 			"replaced_run_sstables", len(replacedRun),
 			"kept_run_sstables", len(keptRun),
-			"manifest_version", newManifest.Version)
+			"manifest_version", newManifest.Version,
+			"bytes_written", bytesWritten,
+			"duration", time.Since(start))
 		if c.onCommit != nil {
 			c.onCommit(newManifest)
 		}
